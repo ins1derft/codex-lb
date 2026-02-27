@@ -25,6 +25,20 @@ def test_parse_credential_lines_supports_colon_inside_password():
     assert parsed[1].totp_secret == "NB2W45DFOIZA===="
 
 
+def test_parse_credential_lines_supports_email_otp_format():
+    parsed = parse_credential_lines(
+        "login@example.com:pa:ss:word:mailbox@example.com:mail-pass-123",
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].line == 1
+    assert parsed[0].email == "login@example.com"
+    assert parsed[0].account_password == "pa:ss:word"
+    assert parsed[0].totp_secret is None
+    assert parsed[0].otp_email == "mailbox@example.com"
+    assert parsed[0].otp_email_password == "mail-pass-123"
+
+
 def test_parse_credential_lines_rejects_empty_payload():
     with pytest.raises(InvalidCredentialFormatError, match="No credentials provided"):
         parse_credential_lines(" \n\t\n")
@@ -33,3 +47,8 @@ def test_parse_credential_lines_rejects_empty_payload():
 def test_parse_credential_lines_rejects_missing_totp_secret():
     with pytest.raises(InvalidCredentialFormatError, match="line 1"):
         parse_credential_lines("alice@example.com:password-only")
+
+
+def test_parse_credential_lines_rejects_missing_email_password_for_email_otp():
+    with pytest.raises(InvalidCredentialFormatError, match="line 1"):
+        parse_credential_lines("alice@example.com:password:mailbox@example.com:")

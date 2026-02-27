@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
@@ -15,6 +16,11 @@ from curl_cffi import requests as curl_requests
 
 from app.core.clients.oauth import OAuthTokens, build_authorization_url, generate_pkce_pair
 from app.core.config.settings import get_settings
+from app.modules.accounts.email_otp_fetcher import (
+    EmailOtpCodeNotFoundError,
+    EmailOtpFetchError,
+    ImapEmailOtpFetcher,
+)
 
 _TWO_FA_LIVE_BASE_URL = "https://2fa.live"
 _SENTINEL_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
@@ -24,6 +30,7 @@ _DEFAULT_USER_AGENT = (
 )
 _DEFAULT_ACCEPT_LANGUAGE = "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3"
 _MFA_TOTP_TYPE = "totp"
+_EMAIL_OTP_PAGE_TYPE = "email_otp_verification"
 
 
 class CredentialAuthorizationError(Exception):
@@ -34,27 +41,37 @@ class CredentialAuthorizationError(Exception):
 class _PasswordVerifyResult:
     continue_url: str | None
     factors: tuple[dict[str, str | None], ...]
+    page_type: str | None
 
 
 class CredentialAuthAutomator:
+    def __init__(self, email_otp_fetcher: ImapEmailOtpFetcher | None = None) -> None:
+        self._email_otp_fetcher = email_otp_fetcher or ImapEmailOtpFetcher()
+
     async def authorize(
         self,
         email: str,
         password: str,
-        totp_secret: str,
+        totp_secret: str | None = None,
+        otp_email: str | None = None,
+        otp_email_password: str | None = None,
     ) -> OAuthTokens:
         return await asyncio.to_thread(
             self._authorize_sync,
             email,
             password,
             totp_secret,
+            otp_email,
+            otp_email_password,
         )
 
     def _authorize_sync(
         self,
         email: str,
         password: str,
-        totp_secret: str,
+        totp_secret: str | None,
+        otp_email: str | None,
+        otp_email_password: str | None,
     ) -> OAuthTokens:
         settings = get_settings()
         auth_base_url = settings.auth_base_url.rstrip("/")
@@ -79,6 +96,8 @@ class CredentialAuthAutomator:
                 email=email,
                 password=password,
                 totp_secret=totp_secret,
+                otp_email=otp_email,
+                otp_email_password=otp_email_password,
                 redirect_uri=settings.oauth_redirect_uri,
                 expected_state=state,
                 timeout_seconds=timeout_seconds,
@@ -103,7 +122,9 @@ class CredentialAuthAutomator:
         issuer: str,
         email: str,
         password: str,
-        totp_secret: str,
+        totp_secret: str | None,
+        otp_email: str | None,
+        otp_email_password: str | None,
         redirect_uri: str,
         expected_state: str,
         timeout_seconds: float,
@@ -171,6 +192,8 @@ class CredentialAuthAutomator:
         continue_url = password_result.continue_url
 
         if password_result.factors:
+            if not totp_secret:
+                raise CredentialAuthorizationError("TOTP secret is required for MFA challenge.")
             factor_id = _pick_mfa_factor_id(password_result.factors, expected_type=_MFA_TOTP_TYPE)
             self._issue_mfa_challenge(
                 session=session,
@@ -190,6 +213,15 @@ class CredentialAuthAutomator:
                 continue_url=continue_url,
                 factor_id=factor_id,
                 mfa_code=mfa_code,
+                timeout_seconds=timeout_seconds,
+            )
+        elif password_result.page_type == _EMAIL_OTP_PAGE_TYPE:
+            continue_url = self._verify_email_otp(
+                session=session,
+                issuer=issuer,
+                continue_url=continue_url,
+                otp_email=otp_email,
+                otp_email_password=otp_email_password,
                 timeout_seconds=timeout_seconds,
             )
 
@@ -358,8 +390,13 @@ class CredentialAuthAutomator:
         )
 
         factors: tuple[dict[str, str | None], ...] = ()
+        page_type: str | None = None
         page = response.get("page")
-        if isinstance(page, dict) and page.get("type") == "mfa_challenge":
+        if isinstance(page, dict):
+            raw_page_type = page.get("type")
+            if isinstance(raw_page_type, str):
+                page_type = raw_page_type
+        if isinstance(page, dict) and page_type == "mfa_challenge":
             payload = page.get("payload")
             raw_factors = payload.get("factors") if isinstance(payload, dict) else None
             if isinstance(raw_factors, list):
@@ -376,7 +413,97 @@ class CredentialAuthAutomator:
                         },
                     )
                 factors = tuple(parsed_factors)
-        return _PasswordVerifyResult(continue_url=parsed_continue_url, factors=factors)
+        return _PasswordVerifyResult(continue_url=parsed_continue_url, factors=factors, page_type=page_type)
+
+    def _verify_email_otp(
+        self,
+        *,
+        session: curl_requests.Session,
+        issuer: str,
+        continue_url: str | None,
+        otp_email: str | None,
+        otp_email_password: str | None,
+        timeout_seconds: float,
+    ) -> str:
+        if not continue_url:
+            raise CredentialAuthorizationError("Missing continue_url before email OTP verification.")
+        if not otp_email or not otp_email_password:
+            raise CredentialAuthorizationError("Mailbox credentials are required for email OTP verification.")
+
+        self._resend_email_otp(
+            session=session,
+            issuer=issuer,
+            continue_url=continue_url,
+            timeout_seconds=timeout_seconds,
+        )
+        fetch_start = datetime.now(timezone.utc) - timedelta(minutes=1)
+        try:
+            otp_code = self._email_otp_fetcher.fetch_otp_code(
+                mailbox_email=otp_email,
+                mailbox_password=otp_email_password,
+                timeout_seconds=min(max(timeout_seconds, 10.0), 120.0),
+                since=fetch_start,
+            )
+        except EmailOtpCodeNotFoundError:
+            self._resend_email_otp(
+                session=session,
+                issuer=issuer,
+                continue_url=continue_url,
+                timeout_seconds=timeout_seconds,
+            )
+            try:
+                otp_code = self._email_otp_fetcher.fetch_otp_code(
+                    mailbox_email=otp_email,
+                    mailbox_password=otp_email_password,
+                    timeout_seconds=min(max(timeout_seconds, 10.0), 120.0),
+                    since=datetime.now(timezone.utc) - timedelta(minutes=1),
+                )
+            except EmailOtpFetchError as exc:
+                raise CredentialAuthorizationError(str(exc)) from exc
+        except EmailOtpFetchError as exc:
+            raise CredentialAuthorizationError(str(exc)) from exc
+
+        response = self._post_continue_request(
+            session=session,
+            url=f"{issuer}/api/accounts/email-otp/validate",
+            headers=_json_headers(referer=continue_url, origin=issuer),
+            payload={"code": otp_code},
+            label="Email OTP validate",
+            timeout_seconds=timeout_seconds,
+        )
+        return _resolve_continue_url(
+            continue_url=response.get("continue_url"),
+            issuer=issuer,
+            label="email-otp/validate",
+        )
+
+    def _resend_email_otp(
+        self,
+        *,
+        session: curl_requests.Session,
+        issuer: str,
+        continue_url: str,
+        timeout_seconds: float,
+    ) -> None:
+        response = session.post(
+            f"{issuer}/api/accounts/email-otp/resend",
+            headers={
+                "Accept": "*/*",
+                "Origin": issuer,
+                "Referer": continue_url,
+                "User-Agent": _DEFAULT_USER_AGENT,
+                "Accept-Language": _DEFAULT_ACCEPT_LANGUAGE,
+            },
+            allow_redirects=True,
+            timeout=timeout_seconds,
+        )
+        payload = self._read_json_dict(response, label="Email OTP resend")
+        if response.status_code >= 400:
+            message = _extract_error_message(
+                payload,
+                default=f"Email OTP resend failed with status {response.status_code}.",
+            )
+            raise CredentialAuthorizationError(message)
 
     def _issue_mfa_challenge(
         self,

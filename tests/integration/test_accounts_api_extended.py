@@ -392,6 +392,60 @@ async def test_import_credentials_batch_success(async_client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_import_credentials_email_otp_format(async_client, monkeypatch):
+    observed: dict[str, str] = {}
+
+    async def _fake_authorize(
+        self,
+        email: str,
+        password: str,
+        totp_secret: str | None = None,
+        otp_email: str | None = None,
+        otp_email_password: str | None = None,
+    ) -> OAuthTokens:
+        observed["email"] = email
+        observed["password"] = password
+        observed["otp_email"] = otp_email or ""
+        observed["otp_email_password"] = otp_email_password or ""
+        assert totp_secret is None
+        payload = {
+            "email": email,
+            "chatgpt_account_id": "acc_email_otp",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+        }
+        return OAuthTokens(
+            access_token="access-email-otp",
+            refresh_token="refresh-email-otp",
+            id_token=_encode_jwt(payload),
+        )
+
+    monkeypatch.setattr(
+        "app.modules.accounts.credential_automator.CredentialAuthAutomator.authorize",
+        _fake_authorize,
+    )
+
+    response = await async_client.post(
+        "/api/accounts/import-credentials",
+        json={
+            "credentialsText": "login@example.com:acc-pass:mailbox@example.com:mailbox-pass",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["imported"] == 1
+    assert payload["failed"] == 0
+    assert payload["results"][0]["status"] == "imported"
+    assert payload["results"][0]["email"] == "login@example.com"
+    assert observed == {
+        "email": "login@example.com",
+        "password": "acc-pass",
+        "otp_email": "mailbox@example.com",
+        "otp_email_password": "mailbox-pass",
+    }
+
+
+@pytest.mark.asyncio
 async def test_import_credentials_invalid_format_returns_400(async_client):
     response = await async_client.post(
         "/api/accounts/import-credentials",

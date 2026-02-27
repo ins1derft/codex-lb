@@ -123,11 +123,19 @@ class AccountsService:
 
         for line in credential_lines:
             try:
-                tokens = await self._credential_automator.authorize(
-                    email=line.email,
-                    password=line.account_password,
-                    totp_secret=line.totp_secret,
-                )
+                if line.totp_secret is not None:
+                    tokens = await self._credential_automator.authorize(
+                        email=line.email,
+                        password=line.account_password,
+                        totp_secret=line.totp_secret,
+                    )
+                else:
+                    tokens = await self._credential_automator.authorize(
+                        email=line.email,
+                        password=line.account_password,
+                        otp_email=line.otp_email,
+                        otp_email_password=line.otp_email_password,
+                    )
                 saved = await self._save_oauth_tokens(tokens, owner_user_id=owner_user_id)
                 imported += 1
                 results.append(

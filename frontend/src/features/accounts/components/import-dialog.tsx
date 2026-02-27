@@ -59,7 +59,17 @@ export function ImportDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Import accounts</DialogTitle>
-          <DialogDescription>Upload auth.json or paste credentials in email:password:2fa_secret format.</DialogDescription>
+          <DialogDescription>
+            Upload auth.json or paste credentials in
+            {" "}
+            <code>login:password:2fa_secret</code>
+            {" "}
+            or
+            {" "}
+            <code>login:password:email:email_password</code>
+            {" "}
+            format.
+          </DialogDescription>
         </DialogHeader>
 
         <form className="space-y-4" onSubmit={handleSubmit}>
@@ -97,7 +107,7 @@ export function ImportDialog({
                 id="credentials-text"
                 value={credentialsText}
                 onChange={(event) => setCredentialsText(event.target.value)}
-                placeholder="email:password:2fa_secret"
+                placeholder={`login:password:2fa_secret\nlogin:password:email:email_password`}
                 className="border-input bg-background min-h-36 w-full rounded-md border px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]"
               />
             </div>
