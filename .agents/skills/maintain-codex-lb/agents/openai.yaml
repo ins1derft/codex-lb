@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain codex-lb"
+  short_description: "Implement codex-lb changes with strict TDD workflow"
+  default_prompt: "Use $maintain-codex-lb to implement codex-lb features with TDD and architecture-safe changes."
