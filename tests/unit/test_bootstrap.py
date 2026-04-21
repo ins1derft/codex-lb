@@ -23,14 +23,14 @@ def _patch_settings(monkeypatch: pytest.MonkeyPatch, *, token: str | None) -> No
 def _patch_shared_state(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    password_hash: str | None,
+    has_active_admin: bool,
     bootstrap_token_encrypted: bytes | None,
     bootstrap_token_hash: bytes | None,
 ) -> None:
     monkeypatch.setattr(
         bootstrap_module,
         "_get_shared_bootstrap_state",
-        AsyncMock(return_value=(password_hash, bootstrap_token_encrypted, bootstrap_token_hash)),
+        AsyncMock(return_value=(has_active_admin, bootstrap_token_encrypted, bootstrap_token_hash)),
     )
 
 
@@ -44,7 +44,7 @@ def _patch_encryptor(monkeypatch: pytest.MonkeyPatch) -> TokenEncryptor:
 async def test_has_active_bootstrap_token_returns_true_when_env_var_set(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_settings(monkeypatch, token="manual-token")
     _patch_shared_state(
-        monkeypatch, password_hash=None, bootstrap_token_encrypted=b"ignored", bootstrap_token_hash=b"ignored"
+        monkeypatch, has_active_admin=False, bootstrap_token_encrypted=b"ignored", bootstrap_token_hash=b"ignored"
     )
 
     assert await bootstrap_module.has_active_bootstrap_token() is True
@@ -54,17 +54,17 @@ async def test_has_active_bootstrap_token_returns_true_when_env_var_set(monkeypa
 async def test_has_active_bootstrap_token_returns_true_when_hash_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_settings(monkeypatch, token=None)
     _patch_shared_state(
-        monkeypatch, password_hash=None, bootstrap_token_encrypted=b"encrypted", bootstrap_token_hash=b"hash"
+        monkeypatch, has_active_admin=False, bootstrap_token_encrypted=b"encrypted", bootstrap_token_hash=b"hash"
     )
 
     assert await bootstrap_module.has_active_bootstrap_token() is True
 
 
 @pytest.mark.asyncio
-async def test_has_active_bootstrap_token_returns_false_when_password_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_has_active_bootstrap_token_returns_false_when_admin_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_settings(monkeypatch, token=None)
     _patch_shared_state(
-        monkeypatch, password_hash="configured", bootstrap_token_encrypted=b"encrypted", bootstrap_token_hash=b"hash"
+        monkeypatch, has_active_admin=True, bootstrap_token_encrypted=b"encrypted", bootstrap_token_hash=b"hash"
     )
 
     assert await bootstrap_module.has_active_bootstrap_token() is False
@@ -75,7 +75,7 @@ async def test_has_active_bootstrap_token_returns_false_when_nothing_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_settings(monkeypatch, token=None)
-    _patch_shared_state(monkeypatch, password_hash=None, bootstrap_token_encrypted=None, bootstrap_token_hash=None)
+    _patch_shared_state(monkeypatch, has_active_admin=False, bootstrap_token_encrypted=None, bootstrap_token_hash=None)
 
     assert await bootstrap_module.has_active_bootstrap_token() is False
 
@@ -83,7 +83,7 @@ async def test_has_active_bootstrap_token_returns_false_when_nothing_configured(
 @pytest.mark.asyncio
 async def test_validate_bootstrap_token_accepts_non_ascii_manual_env_token(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_settings(monkeypatch, token="부트스트랩-토큰")
-    _patch_shared_state(monkeypatch, password_hash=None, bootstrap_token_encrypted=None, bootstrap_token_hash=None)
+    _patch_shared_state(monkeypatch, has_active_admin=False, bootstrap_token_encrypted=None, bootstrap_token_hash=None)
 
     assert await bootstrap_module.validate_bootstrap_token("부트스트랩-토큰") is True
 
@@ -93,7 +93,7 @@ async def test_validate_bootstrap_token_checks_stored_hash(monkeypatch: pytest.M
     _patch_settings(monkeypatch, token=None)
     _patch_shared_state(
         monkeypatch,
-        password_hash=None,
+        has_active_admin=False,
         bootstrap_token_encrypted=b"encrypted",
         bootstrap_token_hash=hashlib.sha256("shared-auto-token".encode("utf-8")).digest(),
     )
@@ -106,7 +106,7 @@ async def test_validate_bootstrap_token_checks_stored_hash(monkeypatch: pytest.M
 async def test_has_active_bootstrap_token_reads_uncached_shared_state(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_settings(monkeypatch, token=None)
     _patch_shared_state(
-        monkeypatch, password_hash=None, bootstrap_token_encrypted=b"encrypted", bootstrap_token_hash=b"hash"
+        monkeypatch, has_active_admin=False, bootstrap_token_encrypted=b"encrypted", bootstrap_token_hash=b"hash"
     )
 
     assert await bootstrap_module.has_active_bootstrap_token() is True
@@ -117,7 +117,7 @@ async def test_validate_bootstrap_token_reads_uncached_shared_state(monkeypatch:
     _patch_settings(monkeypatch, token=None)
     _patch_shared_state(
         monkeypatch,
-        password_hash=None,
+        has_active_admin=False,
         bootstrap_token_encrypted=b"encrypted",
         bootstrap_token_hash=hashlib.sha256("shared-auto-token".encode("utf-8")).digest(),
     )
@@ -129,7 +129,22 @@ async def test_validate_bootstrap_token_reads_uncached_shared_state(monkeypatch:
 async def test_get_bootstrap_validation_status_reports_password_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_settings(monkeypatch, token=None)
     _patch_shared_state(
-        monkeypatch, password_hash="configured", bootstrap_token_encrypted=None, bootstrap_token_hash=None
+        monkeypatch, has_active_admin=True, bootstrap_token_encrypted=None, bootstrap_token_hash=None
+    )
+
+    assert await bootstrap_module.get_bootstrap_validation_status("shared-auto-token") == "password_already_configured"
+
+
+@pytest.mark.asyncio
+async def test_get_bootstrap_validation_status_prefers_admin_conflict_over_stale_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_settings(monkeypatch, token=None)
+    _patch_shared_state(
+        monkeypatch,
+        has_active_admin=True,
+        bootstrap_token_encrypted=b"encrypted",
+        bootstrap_token_hash=hashlib.sha256("shared-auto-token".encode("utf-8")).digest(),
     )
 
     assert await bootstrap_module.get_bootstrap_validation_status("shared-auto-token") == "password_already_configured"
@@ -153,6 +168,7 @@ async def test_ensure_auto_bootstrap_token_reuses_existing_encrypted_token(monke
         clear_bootstrap_token=AsyncMock(),
         store_bootstrap_token_if_absent=AsyncMock(),
     )
+    users_repository = SimpleNamespace(count_admins=AsyncMock(return_value=0))
 
     class _SessionContext:
         async def __aenter__(self):
@@ -163,9 +179,46 @@ async def test_ensure_auto_bootstrap_token_reuses_existing_encrypted_token(monke
 
     monkeypatch.setattr(bootstrap_module, "SessionLocal", lambda: _SessionContext())
     monkeypatch.setattr(bootstrap_module, "DashboardAuthRepository", lambda _session: repository)
+    monkeypatch.setattr(bootstrap_module, "UsersRepository", lambda _session: users_repository)
 
     assert await bootstrap_module.ensure_auto_bootstrap_token() == "shared-auto-token"
     repository.store_bootstrap_token_if_absent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_auto_bootstrap_token_clears_stale_token_when_admin_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_settings(monkeypatch, token=None)
+    repository = SimpleNamespace(
+        get_settings=AsyncMock(
+            return_value=SimpleNamespace(
+                bootstrap_token_encrypted=b"encrypted",
+                bootstrap_token_hash=b"hash",
+            )
+        ),
+        clear_bootstrap_token=AsyncMock(return_value=True),
+        store_bootstrap_token_if_absent=AsyncMock(),
+    )
+    users_repository = SimpleNamespace(count_admins=AsyncMock(return_value=1))
+    settings_cache = SimpleNamespace(invalidate=AsyncMock())
+
+    class _SessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(bootstrap_module, "SessionLocal", lambda: _SessionContext())
+    monkeypatch.setattr(bootstrap_module, "DashboardAuthRepository", lambda _session: repository)
+    monkeypatch.setattr(bootstrap_module, "UsersRepository", lambda _session: users_repository)
+    monkeypatch.setattr(bootstrap_module, "get_settings_cache", lambda: settings_cache)
+
+    assert await bootstrap_module.ensure_auto_bootstrap_token() is None
+    repository.clear_bootstrap_token.assert_awaited_once()
+    repository.store_bootstrap_token_if_absent.assert_not_called()
+    settings_cache.invalidate.assert_awaited_once()
 
 
 def test_log_bootstrap_token_emits_at_warning_level_so_docker_default_surfaces_it() -> None:

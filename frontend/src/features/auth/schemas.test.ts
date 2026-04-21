@@ -9,6 +9,11 @@ describe("AuthSessionSchema", () => {
       passwordRequired: true,
       totpRequiredOnLogin: false,
       totpConfigured: true,
+      user: {
+        id: "user_admin",
+        username: "admin",
+        role: "admin",
+      },
       authMode: "trusted_header",
       passwordManagementEnabled: true,
     });
@@ -18,6 +23,11 @@ describe("AuthSessionSchema", () => {
       passwordRequired: true,
       totpRequiredOnLogin: false,
       totpConfigured: true,
+      user: {
+        id: "user_admin",
+        username: "admin",
+        role: "admin",
+      },
       bootstrapRequired: false,
       bootstrapTokenConfigured: false,
       authMode: "trusted_header",
@@ -52,17 +62,28 @@ describe("AuthSessionSchema", () => {
 });
 
 describe("LoginRequestSchema", () => {
-  it("accepts non-empty password", () => {
+  it("accepts username and non-empty password", () => {
     expect(
       LoginRequestSchema.safeParse({
+        username: "admin",
         password: "strong-password",
       }).success,
     ).toBe(true);
   });
 
+  it("rejects empty username", () => {
+    expect(
+      LoginRequestSchema.safeParse({
+        username: "",
+        password: "strong-password",
+      }).success,
+    ).toBe(false);
+  });
+
   it("rejects empty password", () => {
     expect(
       LoginRequestSchema.safeParse({
+        username: "admin",
         password: "",
       }).success,
     ).toBe(false);

@@ -11,7 +11,6 @@ import { useAuthStore } from "@/features/auth/hooks/use-auth";
 export function AuthGate({ children }: PropsWithChildren) {
   const refreshSessionStable = useAuthStore((state) => state.refreshSession);
   const initialized = useAuthStore((state) => state.initialized);
-  const loading = useAuthStore((state) => state.loading);
   const passwordRequired = useAuthStore((state) => state.passwordRequired);
   const authenticated = useAuthStore((state) => state.authenticated);
   const bootstrapRequired = useAuthStore((state) => state.bootstrapRequired);
@@ -23,7 +22,7 @@ export function AuthGate({ children }: PropsWithChildren) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  if (!initialized && loading) {
+  if (!initialized) {
     return (
       <div className="flex min-h-screen items-center justify-center">
         <SpinnerBlock />

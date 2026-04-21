@@ -10,6 +10,7 @@ from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
 from app.db.session import SessionLocal
 from app.modules.dashboard_auth.repository import DashboardAuthRepository
+from app.modules.users.repository import UsersRepository
 
 logger = logging.getLogger(__name__)
 _encryptor: TokenEncryptor | None = None
@@ -55,10 +56,11 @@ async def get_active_bootstrap_token() -> str | None:
     return _get_manual_bootstrap_token()
 
 
-async def _get_shared_bootstrap_state() -> tuple[str | None, bytes | None, bytes | None]:
+async def _get_shared_bootstrap_state() -> tuple[bool, bytes | None, bytes | None]:
     async with SessionLocal() as session:
         settings = await DashboardAuthRepository(session).get_settings()
-        return settings.password_hash, settings.bootstrap_token_encrypted, settings.bootstrap_token_hash
+        has_active_admin = await UsersRepository(session).count_admins() > 0
+        return has_active_admin, settings.bootstrap_token_encrypted, settings.bootstrap_token_hash
 
 
 async def has_active_bootstrap_token() -> bool:
@@ -66,8 +68,8 @@ async def has_active_bootstrap_token() -> bool:
     if manual:
         return True
 
-    password_hash, _, bootstrap_token_hash = await _get_shared_bootstrap_state()
-    return password_hash is None and bootstrap_token_hash is not None
+    has_active_admin, _, bootstrap_token_hash = await _get_shared_bootstrap_state()
+    return not has_active_admin and bootstrap_token_hash is not None
 
 
 async def validate_bootstrap_token(submitted_token: str) -> bool:
@@ -75,8 +77,8 @@ async def validate_bootstrap_token(submitted_token: str) -> bool:
     if manual is not None:
         return compare_digest(submitted_token.encode("utf-8"), manual.encode("utf-8"))
 
-    password_hash, _, bootstrap_token_hash = await _get_shared_bootstrap_state()
-    if password_hash is not None or bootstrap_token_hash is None:
+    has_active_admin, _, bootstrap_token_hash = await _get_shared_bootstrap_state()
+    if has_active_admin or bootstrap_token_hash is None:
         return False
     return compare_digest(_hash_bootstrap_token(submitted_token), bootstrap_token_hash)
 
@@ -88,13 +90,13 @@ async def get_bootstrap_validation_status(submitted_token: str) -> str:
             return "valid"
         return "invalid"
 
-    password_hash, _, bootstrap_token_hash = await _get_shared_bootstrap_state()
+    has_active_admin, _, bootstrap_token_hash = await _get_shared_bootstrap_state()
+    if has_active_admin:
+        return "password_already_configured"
     if bootstrap_token_hash is None:
-        return "password_already_configured" if password_hash is not None else "unavailable"
+        return "unavailable"
     if compare_digest(_hash_bootstrap_token(submitted_token), bootstrap_token_hash):
         return "valid"
-    if password_hash is not None:
-        return "password_already_configured"
     return "invalid"
 
 
@@ -104,8 +106,9 @@ async def ensure_auto_bootstrap_token() -> str | None:
     async with SessionLocal() as session:
         repository = DashboardAuthRepository(session)
         settings = await repository.get_settings()
+        has_active_admin = await UsersRepository(session).count_admins() > 0
 
-        if manual or settings.password_hash is not None:
+        if manual or has_active_admin:
             if settings.bootstrap_token_hash is not None:
                 await repository.clear_bootstrap_token()
                 await get_settings_cache().invalidate()

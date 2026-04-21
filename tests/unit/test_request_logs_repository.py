@@ -22,7 +22,7 @@ async def test_add_log_ignores_closed_transaction(monkeypatch) -> None:
         monkeypatch.setattr(session, "refresh", _refresh_failure)
 
         log = await repo.add_log(
-            account_id="acc",
+            account_id=None,
             request_id="req",
             model="gpt-5.2",
             input_tokens=1000,

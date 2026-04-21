@@ -15,6 +15,7 @@ export type RequestLogsListFilters = {
   limit?: number;
   offset?: number;
   search?: string;
+  ownerUserId?: string;
   accountIds?: string[];
   statuses?: string[];
   modelOptions?: string[];
@@ -25,12 +26,14 @@ export type RequestLogsListFilters = {
 export type RequestLogFacetFilters = {
   since?: string;
   until?: string;
+  ownerUserId?: string;
   accountIds?: string[];
   modelOptions?: string[];
 };
 
 export type DashboardOverviewParams = {
   timeframe?: OverviewTimeframe;
+  ownerUserId?: string;
 };
 
 function appendMany(params: URLSearchParams, key: string, values?: string[]): void {
@@ -47,6 +50,9 @@ function appendMany(params: URLSearchParams, key: string, values?: string[]): vo
 export function getDashboardOverview(params: DashboardOverviewParams = {}) {
   const query = new URLSearchParams();
   query.set("timeframe", params.timeframe ?? DEFAULT_OVERVIEW_TIMEFRAME);
+  if (params.ownerUserId) {
+    query.set("ownerUserId", params.ownerUserId);
+  }
   return get(`${DASHBOARD_PATH}/overview?${query.toString()}`, DashboardOverviewSchema);
 }
 
@@ -60,6 +66,9 @@ export function getRequestLogs(params: RequestLogsListFilters = {}) {
   }
   if (params.search) {
     query.set("search", params.search);
+  }
+  if (params.ownerUserId) {
+    query.set("ownerUserId", params.ownerUserId);
   }
   appendMany(query, "accountId", params.accountIds);
   appendMany(query, "status", params.statuses);
@@ -81,6 +90,9 @@ export function getRequestLogOptions(params: RequestLogFacetFilters = {}) {
   }
   if (params.until) {
     query.set("until", params.until);
+  }
+  if (params.ownerUserId) {
+    query.set("ownerUserId", params.ownerUserId);
   }
   appendMany(query, "accountId", params.accountIds);
   appendMany(query, "modelOption", params.modelOptions);

@@ -6050,11 +6050,7 @@ class ProxyService:
                 "%s request budget exhausted before account selection request_id=%s", kind.title(), request_id
             )
             _raise_proxy_budget_exhausted()
-        scoped_account_ids = (
-            set(api_key.assigned_account_ids)
-            if api_key is not None and api_key.account_assignment_scope_enabled
-            else None
-        )
+        scoped_account_ids = await self._scoped_account_ids_for_api_key(api_key)
         excluded_account_ids_set = set(exclude_account_ids or ())
         try:
             with anyio.fail_after(remaining_budget):
@@ -6108,6 +6104,17 @@ class ProxyService:
         except TimeoutError:
             logger.warning("%s account selection exceeded request budget request_id=%s", kind.title(), request_id)
             _raise_proxy_budget_exhausted()
+
+    async def _scoped_account_ids_for_api_key(self, api_key: ApiKeyData | None) -> set[str] | None:
+        if api_key is None:
+            return None
+        if api_key.account_assignment_scope_enabled:
+            return set(api_key.assigned_account_ids)
+        if api_key.owner_user_id is None:
+            return None
+        async with self._repo_factory() as repos:
+            account_ids = await repos.accounts.list_account_ids(owner_user_id=api_key.owner_user_id)
+        return set(account_ids)
 
     async def _handle_proxy_error(self, account: Account, exc: ProxyResponseError) -> None:
         error = _parse_openai_error(exc.payload)

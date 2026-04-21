@@ -27,6 +27,11 @@ describe("useAuthStore unauthorized handler", () => {
     useAuthStore.setState({
       authenticated: true,
       initialized: true,
+      user: {
+        id: "user_admin",
+        username: "admin",
+        role: "admin",
+      },
       bootstrapRequired: true,
       bootstrapTokenConfigured: true,
       error: "boom",
@@ -38,6 +43,7 @@ describe("useAuthStore unauthorized handler", () => {
     const next = useAuthStore.getState();
     expect(next.authenticated).toBe(false);
     expect(next.initialized).toBe(true);
+    expect(next.user).toBeNull();
     expect(next.error).toBeNull();
     expect(next.bootstrapRequired).toBe(true);
     expect(next.bootstrapTokenConfigured).toBe(true);

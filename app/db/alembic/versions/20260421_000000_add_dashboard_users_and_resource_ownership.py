@@ -1,8 +1,8 @@
 """add dashboard users and resource ownership columns
 
-Revision ID: 013_add_dashboard_users_and_resource_ownership
-Revises: 012_add_import_without_overwrite_and_drop_accounts_email_unique
-Create Date: 2026-02-25
+Revision ID: 20260421_000000_add_dashboard_users_and_resource_ownership
+Revises: 20260417_000000_add_request_log_plan_type
+Create Date: 2026-04-21
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from alembic import op
 from sqlalchemy.engine import Connection
 
 # revision identifiers, used by Alembic.
-revision = "013_add_dashboard_users_and_resource_ownership"
-down_revision = "012_add_import_without_overwrite_and_drop_accounts_email_unique"
+revision = "20260421_000000_add_dashboard_users_and_resource_ownership"
+down_revision = "20260417_000000_add_request_log_plan_type"
 branch_labels = None
 depends_on = None
 
@@ -107,14 +107,33 @@ def _ensure_owner_columns(connection: Connection) -> None:
 
 
 def _ensure_owner_indexes(connection: Connection) -> None:
-    if _table_exists(connection, "accounts") and not _index_exists(connection, "accounts", "idx_accounts_owner_user_id"):
+    if _table_exists(connection, "accounts") and not _index_exists(
+        connection,
+        "accounts",
+        "idx_accounts_owner_user_id",
+    ):
         op.create_index("idx_accounts_owner_user_id", "accounts", ["owner_user_id"], unique=False)
-    if _table_exists(connection, "api_keys") and not _index_exists(connection, "api_keys", "idx_api_keys_owner_user_id"):
+    if _table_exists(connection, "api_keys") and not _index_exists(
+        connection,
+        "api_keys",
+        "idx_api_keys_owner_user_id",
+    ):
         op.create_index("idx_api_keys_owner_user_id", "api_keys", ["owner_user_id"], unique=False)
     if _table_exists(connection, "dashboard_users") and not _index_exists(
         connection, "dashboard_users", "idx_dashboard_users_username"
     ):
         op.create_index("idx_dashboard_users_username", "dashboard_users", ["username"], unique=True)
+
+
+def _existing_dashboard_password_hash(connection: Connection) -> str | None:
+    if not _table_exists(connection, "dashboard_settings"):
+        return None
+    if "password_hash" not in _columns(connection, "dashboard_settings"):
+        return None
+    row = connection.execute(sa.text("SELECT password_hash FROM dashboard_settings WHERE id = 1 LIMIT 1")).first()
+    if row is None or not row[0]:
+        return None
+    return str(row[0])
 
 
 def _ensure_default_admin(connection: Connection) -> str:
@@ -128,8 +147,10 @@ def _ensure_default_admin(connection: Connection) -> str:
     if existing is not None and existing[0]:
         return str(existing[0])
 
-    bootstrap_password = _bootstrap_admin_password()
-    hashed_password = bcrypt.hashpw(bootstrap_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    hashed_password = _existing_dashboard_password_hash(connection)
+    if hashed_password is None:
+        bootstrap_password = _bootstrap_admin_password()
+        hashed_password = bcrypt.hashpw(bootstrap_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     connection.execute(
         sa.text(
             """

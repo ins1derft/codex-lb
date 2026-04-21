@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
-import { LoginRequestSchema } from "@/features/auth/schemas";
+import { LoginRequestSchema, type LoginRequest } from "@/features/auth/schemas";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
 
 export function LoginForm() {
@@ -16,12 +16,12 @@ export function LoginForm() {
   const error = useAuthStore((state) => state.error);
   const clearError = useAuthStore((state) => state.clearError);
 
-  const form = useForm({
+  const form = useForm<LoginRequest>({
     resolver: zodResolver(LoginRequestSchema),
     defaultValues: { username: "admin", password: "" },
   });
 
-  const handleSubmit = async (values: { username: string; password: string }) => {
+  const handleSubmit = async (values: LoginRequest) => {
     clearError();
     await login(values.username, values.password);
   };

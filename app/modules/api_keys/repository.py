@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.utils.time import utcnow
 from app.db.models import (
+    Account,
     ApiKey,
     ApiKeyAccountAssignment,
     ApiKeyLimit,
@@ -98,11 +99,15 @@ class ApiKeysRepository:
         owner_user_id: str | _Unset = _UNSET,
         name: str | _Unset = _UNSET,
         allowed_models: str | None | _Unset = _UNSET,
+        enforced_model: str | None | _Unset = _UNSET,
+        enforced_reasoning_effort: str | None | _Unset = _UNSET,
+        enforced_service_tier: str | None | _Unset = _UNSET,
         expires_at: datetime | None | _Unset = _UNSET,
         is_active: bool | _Unset = _UNSET,
         key_hash: str | _Unset = _UNSET,
         key_prefix: str | _Unset = _UNSET,
         owner_scope_user_id: str | None = None,
+        commit: bool = True,
     ) -> ApiKey | None:
         row = await self.get_by_id(key_id, owner_user_id=owner_scope_user_id)
         if row is None:
@@ -116,6 +121,15 @@ class ApiKeysRepository:
         if allowed_models is not _UNSET:
             assert allowed_models is None or isinstance(allowed_models, str)
             row.allowed_models = allowed_models
+        if enforced_model is not _UNSET:
+            assert enforced_model is None or isinstance(enforced_model, str)
+            row.enforced_model = enforced_model
+        if enforced_reasoning_effort is not _UNSET:
+            assert enforced_reasoning_effort is None or isinstance(enforced_reasoning_effort, str)
+            row.enforced_reasoning_effort = enforced_reasoning_effort
+        if enforced_service_tier is not _UNSET:
+            assert enforced_service_tier is None or isinstance(enforced_service_tier, str)
+            row.enforced_service_tier = enforced_service_tier
         if expires_at is not _UNSET:
             assert expires_at is None or isinstance(expires_at, datetime)
             row.expires_at = expires_at
@@ -128,9 +142,46 @@ class ApiKeysRepository:
         if key_prefix is not _UNSET:
             assert isinstance(key_prefix, str)
             row.key_prefix = key_prefix
-        await self._session.commit()
-        await self._session.refresh(row)
+        if commit:
+            await self._session.commit()
+            await self._session.refresh(row)
+        else:
+            await self._session.flush()
         return row
+
+    async def replace_account_assignments(
+        self,
+        key_id: str,
+        account_ids: list[str],
+        *,
+        commit: bool = True,
+    ) -> bool:
+        row = await self.get_by_id(key_id)
+        if row is None:
+            return False
+
+        unique_account_ids = list(dict.fromkeys(account_ids))
+        if unique_account_ids:
+            result = await self._session.execute(select(Account.id).where(Account.id.in_(unique_account_ids)))
+            existing_account_ids = set(result.scalars().all())
+            missing_account_ids = [
+                account_id for account_id in unique_account_ids if account_id not in existing_account_ids
+            ]
+            if missing_account_ids:
+                raise ValueError(f"Unknown account IDs: {', '.join(missing_account_ids)}")
+
+        row.account_assignment_scope_enabled = bool(unique_account_ids)
+        row.account_assignments = [
+            ApiKeyAccountAssignment(api_key_id=key_id, account_id=account_id)
+            for account_id in unique_account_ids
+        ]
+
+        if commit:
+            await self._session.commit()
+            await self._session.refresh(row, attribute_names=["account_assignments"])
+        else:
+            await self._session.flush()
+        return True
 
     async def delete(self, key_id: str, *, owner_scope_user_id: str | None = None) -> bool:
         row = await self.get_by_id(key_id, owner_user_id=owner_scope_user_id)
@@ -169,7 +220,13 @@ class ApiKeysRepository:
             await self._session.refresh(parent, attribute_names=["limits"])
         return await self.get_limits_by_key(key_id)
 
-    async def upsert_limits(self, key_id: str, limits: list[ApiKeyLimit]) -> list[ApiKeyLimit]:
+    async def upsert_limits(
+        self,
+        key_id: str,
+        limits: list[ApiKeyLimit],
+        *,
+        commit: bool = True,
+    ) -> list[ApiKeyLimit]:
         existing = await self.get_limits_by_key(key_id)
         existing_by_key = {_limit_key(limit): limit for limit in existing}
         incoming_keys = {_limit_key(limit) for limit in limits}
@@ -189,10 +246,13 @@ class ApiKeysRepository:
             if _limit_key(old_limit) not in incoming_keys:
                 await self._session.delete(old_limit)
 
-        await self._session.commit()
-        parent = await self._session.get(ApiKey, key_id)
-        if parent is not None:
-            await self._session.refresh(parent, attribute_names=["limits"])
+        if commit:
+            await self._session.commit()
+            parent = await self._session.get(ApiKey, key_id)
+            if parent is not None:
+                await self._session.refresh(parent, attribute_names=["limits"])
+        else:
+            await self._session.flush()
         return await self.get_limits_by_key(key_id)
 
     async def increment_limit_usage(

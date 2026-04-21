@@ -34,6 +34,7 @@ const LIMIT_TYPE_SHORT: Record<LimitType, string> = {
   input_tokens: "Input",
   output_tokens: "Output",
   cost_usd: "Cost",
+  credits: "Credits",
 };
 
 function formatLimitSummary(limits: LimitRule[]): string {

@@ -40,7 +40,7 @@ export function PasswordSettings({ disabled = false }: PasswordSettingsProps) {
   const passwordManagementEnabled = useAuthStore((s) => s.passwordManagementEnabled);
   const passwordSessionActive = useAuthStore((s) => s.passwordSessionActive);
   const refreshSession = useAuthStore((s) => s.refreshSession);
-
+  const user = useAuthStore((s) => s.user);
   const authenticated = useAuthStore((s) => s.authenticated);
   const [activeDialog, setActiveDialog] = useState<PasswordDialog>(null);
   const [verifyStep, setVerifyStep] = useState<"password" | "totp">("password");
@@ -130,8 +130,15 @@ export function PasswordSettings({ disabled = false }: PasswordSettingsProps) {
 
   const handleVerify = async (values: { password: string }) => {
     setError(null);
+    if (!user?.username) {
+      setError("Authenticated user is required");
+      return;
+    }
     try {
-      const session = await loginPassword(values);
+      const session = await loginPassword({
+        username: user.username,
+        password: values.password,
+      });
       if (session.totpRequiredOnLogin && !session.passwordSessionActive) {
         setVerifyStep("totp");
         return;

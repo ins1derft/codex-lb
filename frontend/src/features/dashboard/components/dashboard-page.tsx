@@ -165,8 +165,6 @@ export function DashboardPage() {
             secondaryItems={view.secondaryUsageItems}
             primaryTotal={overview?.summary.primaryWindow.capacityCredits ?? 0}
             secondaryTotal={overview?.summary.secondaryWindow?.capacityCredits ?? 0}
-            primaryWindowMinutes={overview?.windows.primary.windowMinutes ?? null}
-            secondaryWindowMinutes={overview?.windows.secondary?.windowMinutes ?? null}
           />
 
           <section className="space-y-4">

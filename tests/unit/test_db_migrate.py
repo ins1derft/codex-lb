@@ -306,6 +306,92 @@ def test_run_upgrade_auto_remaps_legacy_revision_ids(tmp_path: Path) -> None:
     assert result.current_revision == initial.current_revision
 
 
+def test_run_upgrade_auto_remaps_legacy_dashboard_users_revision_id(tmp_path: Path) -> None:
+    db_path = tmp_path / "dashboard-users-remap.db"
+    url = _db_url(db_path)
+    ancestor = "20260218_000100_add_import_without_overwrite_and_drop_accounts_email_unique"
+
+    run_upgrade(url, ancestor, bootstrap_legacy=False)
+
+    sync_url = to_sync_database_url(url)
+    with create_engine(sync_url, future=True).begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE dashboard_users (
+                    id VARCHAR PRIMARY KEY,
+                    username VARCHAR NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role VARCHAR NOT NULL,
+                    is_active BOOLEAN NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(text("ALTER TABLE accounts ADD COLUMN owner_user_id VARCHAR"))
+        connection.execute(text("ALTER TABLE api_keys ADD COLUMN owner_user_id VARCHAR"))
+        connection.execute(text("CREATE INDEX idx_accounts_owner_user_id ON accounts (owner_user_id)"))
+        connection.execute(text("CREATE INDEX idx_api_keys_owner_user_id ON api_keys (owner_user_id)"))
+        connection.execute(text("CREATE UNIQUE INDEX idx_dashboard_users_username ON dashboard_users (username)"))
+        connection.execute(
+            text(
+                """
+                INSERT INTO dashboard_users (id, username, password_hash, role, is_active)
+                VALUES ('dashboard-user-admin-default', 'admin', 'legacy-hash', 'admin', 1)
+                """
+            )
+        )
+        connection.execute(
+            text("UPDATE alembic_version SET version_num = :legacy"),
+            {"legacy": "013_add_dashboard_users_and_resource_ownership"},
+        )
+
+    result = run_upgrade(url, "head", bootstrap_legacy=False)
+    assert result.current_revision == inspect_migration_state(url).head_revision
+
+    with create_engine(sync_url, future=True).connect() as connection:
+        inspector = inspect(connection)
+        assert inspector.has_table("api_firewall_allowlist")
+        assert inspector.has_table("dashboard_users")
+        admin_hash = connection.execute(
+            text("SELECT password_hash FROM dashboard_users WHERE username = 'admin'"),
+        ).scalar_one()
+
+    assert admin_hash == "legacy-hash"
+
+
+def test_dashboard_users_migration_preserves_existing_dashboard_password_hash(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "dashboard-users-password.db"
+    url = _db_url(db_path)
+    base_revision = "20260417_000000_add_request_log_plan_type"
+    existing_hash = "$2b$12$abcdefghijklmnopqrstuuHzL9TWlBnMVBYQBX5WrhbQfoD59jS9q"
+
+    run_upgrade(url, base_revision, bootstrap_legacy=False)
+
+    sync_url = to_sync_database_url(url)
+    with create_engine(sync_url, future=True).begin() as connection:
+        connection.execute(
+            text("UPDATE dashboard_settings SET password_hash = :password_hash WHERE id = 1"),
+            {"password_hash": existing_hash},
+        )
+
+    monkeypatch.delenv("CODEX_LB_BOOTSTRAP_ADMIN_PASSWORD", raising=False)
+    result = run_upgrade(url, "head", bootstrap_legacy=False)
+    assert result.current_revision == "20260421_000000_add_dashboard_users_and_resource_ownership"
+
+    with create_engine(sync_url, future=True).connect() as connection:
+        admin_hash = connection.execute(
+            text("SELECT password_hash FROM dashboard_users WHERE username = 'admin'"),
+        ).scalar_one()
+
+    assert admin_hash == existing_hash
+
+
 def test_run_upgrade_without_auto_remap_fails_for_legacy_revision_ids(tmp_path: Path) -> None:
     db_path = tmp_path / "no-remap.db"
     url = _db_url(db_path)

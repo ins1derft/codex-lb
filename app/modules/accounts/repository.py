@@ -40,7 +40,19 @@ class AccountsRepository:
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
-    async def exists_active_chatgpt_account_id(self, chatgpt_account_id: str, *, owner_user_id: str | None = None) -> bool:
+    async def list_account_ids(self, *, owner_user_id: str | None = None) -> list[str]:
+        stmt = select(Account.id).order_by(Account.email)
+        if owner_user_id is not None:
+            stmt = stmt.where(Account.owner_user_id == owner_user_id)
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def exists_active_chatgpt_account_id(
+        self,
+        chatgpt_account_id: str,
+        *,
+        owner_user_id: str | None = None,
+    ) -> bool:
         stmt = (
             select(Account.id)
             .where(Account.chatgpt_account_id == chatgpt_account_id)
@@ -191,7 +203,12 @@ class AccountsRepository:
         return candidate
 
     async def _single_account_by_email(self, email: str, *, owner_user_id: str | None = None) -> Account | None:
-        stmt = select(Account).where(Account.email == email).order_by(Account.created_at.asc(), Account.id.asc()).limit(2)
+        stmt = (
+            select(Account)
+            .where(Account.email == email)
+            .order_by(Account.created_at.asc(), Account.id.asc())
+            .limit(2)
+        )
         if owner_user_id is not None:
             stmt = stmt.where(Account.owner_user_id == owner_user_id)
         result = await self._session.execute(stmt)

@@ -21,6 +21,7 @@ os.environ["CODEX_LB_USAGE_REFRESH_ENABLED"] = "false"
 os.environ["CODEX_LB_MODEL_REGISTRY_ENABLED"] = "false"
 os.environ["CODEX_LB_STICKY_SESSION_CLEANUP_ENABLED"] = "false"
 os.environ["CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_ENABLED"] = "false"
+os.environ.setdefault("CODEX_LB_BOOTSTRAP_ADMIN_PASSWORD", f"test-admin-{uuid4().hex}")
 
 from app.db.models import Base  # noqa: E402
 from app.db.session import engine  # noqa: E402

@@ -21,6 +21,11 @@ const sessionBase: AuthSession = {
   passwordRequired: true,
   totpRequiredOnLogin: false,
   totpConfigured: true,
+  user: {
+    id: "user_admin",
+    username: "admin",
+    role: "admin",
+  },
   bootstrapRequired: false,
   bootstrapTokenConfigured: false,
   authMode: "standard",
@@ -34,10 +39,12 @@ function resetAuthStore(): void {
     authenticated: false,
     totpRequiredOnLogin: false,
     totpConfigured: false,
+    user: null,
     bootstrapRequired: false,
     bootstrapTokenConfigured: false,
     authMode: "standard",
     passwordManagementEnabled: true,
+    passwordSessionActive: false,
     loading: false,
     initialized: false,
     error: null,
@@ -69,11 +76,12 @@ describe("useAuthStore actions", () => {
   it("login updates session state", async () => {
     (loginPassword as Mock).mockResolvedValue(sessionBase);
 
-    await useAuthStore.getState().login("secret-pass");
+    await useAuthStore.getState().login("admin", "secret-pass");
 
     const next = useAuthStore.getState();
-    expect(loginPassword).toHaveBeenCalledWith({ password: "secret-pass" });
+    expect(loginPassword).toHaveBeenCalledWith({ username: "admin", password: "secret-pass" });
     expect(next.authenticated).toBe(true);
+    expect(next.user).toEqual(sessionBase.user);
     expect(next.error).toBeNull();
   });
 
@@ -81,6 +89,7 @@ describe("useAuthStore actions", () => {
     useAuthStore.setState({
       authenticated: true,
       passwordRequired: true,
+      user: sessionBase.user,
       initialized: true,
     });
 
@@ -97,6 +106,7 @@ describe("useAuthStore actions", () => {
     expect(logoutRequest).toHaveBeenCalledTimes(1);
     expect(getAuthSession).toHaveBeenCalledTimes(1);
     expect(next.authenticated).toBe(false);
+    expect(next.user).toBeNull();
     expect(next.loading).toBe(false);
   });
 
@@ -113,6 +123,7 @@ describe("useAuthStore actions", () => {
     expect(verifyTotpRequest).toHaveBeenCalledWith({ code: "123456" });
     expect(next.authenticated).toBe(true);
     expect(next.totpRequiredOnLogin).toBe(false);
+    expect(next.user).toEqual(sessionBase.user);
     expect(next.loading).toBe(false);
   });
 });

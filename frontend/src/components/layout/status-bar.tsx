@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Activity, ArrowRightLeft, Tag } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 
+import { useAuthStore } from "@/features/auth/hooks/use-auth";
 import { getDashboardOverview } from "@/features/dashboard/api";
 import { DEFAULT_OVERVIEW_TIMEFRAME } from "@/features/dashboard/schemas";
 import { getSettings } from "@/features/settings/api";
@@ -24,6 +25,7 @@ function getRoutingLabel(strategy: "usage_weighted" | "round_robin" | "capacity_
 }
 
 export function StatusBar() {
+  const isAdmin = useAuthStore((state) => state.user?.role === "admin");
   const { data: lastSyncAt = null } = useQuery({
     queryKey: ["dashboard", "overview", DEFAULT_OVERVIEW_TIMEFRAME],
     queryFn: () => getDashboardOverview({ timeframe: DEFAULT_OVERVIEW_TIMEFRAME }),
@@ -35,6 +37,7 @@ export function StatusBar() {
   const { data: settings } = useQuery({
     queryKey: ["settings", "detail"],
     queryFn: getSettings,
+    enabled: isAdmin,
   });
   const lastSync = formatTimeLong(lastSyncAt);
   const [isLive, setIsLive] = useState(false);

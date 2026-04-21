@@ -10,6 +10,13 @@ The system SHALL persist dashboard login accounts with explicit role assignment 
 - **THEN** the system creates user `admin` with role `admin`
 - **AND** stores only a bcrypt hash of `CODEX_LB_BOOTSTRAP_ADMIN_PASSWORD`
 
+#### Scenario: Existing dashboard password is preserved during upgrade
+
+- **WHEN** the application upgrades from a single-password dashboard install with an existing dashboard password hash
+- **THEN** the system creates user `admin` with role `admin`
+- **AND** reuses the existing password hash for that user
+- **AND** does not require `CODEX_LB_BOOTSTRAP_ADMIN_PASSWORD`
+
 ### Requirement: Username/password authentication
 
 The system SHALL authenticate dashboard sessions using username and password via `POST /api/dashboard-auth/password/login`.

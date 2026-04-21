@@ -21,6 +21,9 @@ OLD_TO_NEW_REVISION_MAP: dict[str, str] = {
         "20260218_000100_add_import_without_overwrite_and_drop_accounts_email_unique"
     ),
     "013_add_dashboard_settings_routing_strategy": "20260225_000000_add_dashboard_settings_routing_strategy",
+    "013_add_dashboard_users_and_resource_ownership": (
+        "20260218_000100_add_import_without_overwrite_and_drop_accounts_email_unique"
+    ),
     "014_add_api_firewall_allowlist": "20260228_030000_add_api_firewall_allowlist",
     "013_add_api_key_enforcement_fields": (
         "20260218_000100_add_import_without_overwrite_and_drop_accounts_email_unique"

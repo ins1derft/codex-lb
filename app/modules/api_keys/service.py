@@ -40,11 +40,15 @@ class ApiKeysRepositoryProtocol(Protocol):
         owner_user_id: str | _Unset = ...,
         name: str | _Unset = ...,
         allowed_models: str | None | _Unset = ...,
+        enforced_model: str | None | _Unset = ...,
+        enforced_reasoning_effort: str | None | _Unset = ...,
+        enforced_service_tier: str | None | _Unset = ...,
         expires_at: datetime | None | _Unset = ...,
         is_active: bool | _Unset = ...,
         key_hash: str | _Unset = ...,
         key_prefix: str | _Unset = ...,
         owner_scope_user_id: str | None = ...,
+        commit: bool = ...,
     ) -> ApiKey | None: ...
 
     async def delete(self, key_id: str, *, owner_scope_user_id: str | None = None) -> bool: ...
@@ -59,7 +63,21 @@ class ApiKeysRepositoryProtocol(Protocol):
 
     async def replace_limits(self, key_id: str, limits: list[ApiKeyLimit]) -> list[ApiKeyLimit]: ...
 
-    async def upsert_limits(self, key_id: str, limits: list[ApiKeyLimit]) -> list[ApiKeyLimit]: ...
+    async def upsert_limits(
+        self,
+        key_id: str,
+        limits: list[ApiKeyLimit],
+        *,
+        commit: bool = ...,
+    ) -> list[ApiKeyLimit]: ...
+
+    async def replace_account_assignments(
+        self,
+        key_id: str,
+        account_ids: list[str],
+        *,
+        commit: bool = ...,
+    ) -> bool: ...
 
     async def increment_limit_usage(
         self,
@@ -263,16 +281,21 @@ class ApiKeysService:
     async def create_key(self, payload: ApiKeyCreateData) -> ApiKeyCreatedData:
         now = utcnow()
         plain_key = _generate_plain_key()
+        allowed_models = _normalize_allowed_models(payload.allowed_models)
+        enforced_model = _normalize_optional_string(payload.enforced_model)
+        enforced_reasoning_effort = _normalize_enforced_reasoning_effort(payload.enforced_reasoning_effort)
+        enforced_service_tier = _normalize_enforced_service_tier(payload.enforced_service_tier)
+        _validate_enforced_model_allowed(enforced_model, allowed_models)
         row = ApiKey(
             id=str(__import__("uuid").uuid4()),
             owner_user_id=payload.owner_user_id,
             name=_normalize_name(payload.name),
             key_hash=_hash_key(plain_key),
             key_prefix=plain_key[:15],
-            allowed_models=_serialize_allowed_models(payload.allowed_models),
-            enforced_model=payload.enforced_model,
-            enforced_reasoning_effort=payload.enforced_reasoning_effort,
-            enforced_service_tier=payload.enforced_service_tier,
+            allowed_models=_serialize_allowed_models(allowed_models),
+            enforced_model=enforced_model,
+            enforced_reasoning_effort=enforced_reasoning_effort,
+            enforced_service_tier=enforced_service_tier,
             expires_at=payload.expires_at,
             is_active=True,
             created_at=now,
@@ -301,39 +324,85 @@ class ApiKeysService:
         *,
         owner_scope_user_id: str | None = None,
     ) -> ApiKeyData:
-        row = await self._repository.update(
-            key_id,
-            name=_normalize_name(payload.name or "") if payload.name_set else _UNSET,
-            allowed_models=_serialize_allowed_models(payload.allowed_models) if payload.allowed_models_set else _UNSET,
-            expires_at=payload.expires_at if payload.expires_at_set else _UNSET,
-            is_active=(payload.is_active if payload.is_active_set and payload.is_active is not None else _UNSET),
-            owner_scope_user_id=owner_scope_user_id,
-        )
-        if row is None:
+        existing = await self._repository.get_by_id(key_id, owner_user_id=owner_scope_user_id)
+        if existing is None:
             raise ApiKeyNotFoundError(f"API key not found: {key_id}")
 
-        if payload.limits_set:
-            now = utcnow()
-            existing_limits = await self._repository.get_limits_by_key(key_id)
-            submitted_limits = payload.limits or []
-            limit_rows = _build_limit_rows_for_update(
-                key_id=key_id,
-                now=now,
-                submitted_limits=submitted_limits,
-                existing_limits=existing_limits,
-                reset_usage=payload.reset_usage,
-            )
-            await self._repository.upsert_limits(key_id, limit_rows)
-        elif payload.reset_usage:
-            now = utcnow()
-            existing_limits = await self._repository.get_limits_by_key(key_id)
-            limit_rows = _build_reset_limit_rows(key_id=key_id, now=now, existing_limits=existing_limits)
-            await self._repository.upsert_limits(key_id, limit_rows)
+        allowed_models = (
+            _normalize_allowed_models(payload.allowed_models)
+            if payload.allowed_models_set
+            else _deserialize_allowed_models(existing.allowed_models)
+        )
+        enforced_model = (
+            _normalize_optional_string(payload.enforced_model)
+            if payload.enforced_model_set
+            else existing.enforced_model
+        )
+        enforced_reasoning_effort = (
+            _normalize_enforced_reasoning_effort(payload.enforced_reasoning_effort)
+            if payload.enforced_reasoning_effort_set
+            else existing.enforced_reasoning_effort
+        )
+        enforced_service_tier = (
+            _normalize_enforced_service_tier(payload.enforced_service_tier)
+            if payload.enforced_service_tier_set
+            else existing.enforced_service_tier
+        )
+        _validate_enforced_model_allowed(enforced_model, allowed_models)
 
-        if payload.limits_set or payload.reset_usage:
-            row = await self._repository.get_by_id(key_id, owner_user_id=owner_scope_user_id)
+        try:
+            row = await self._repository.update(
+                key_id,
+                name=_normalize_name(payload.name or "") if payload.name_set else _UNSET,
+                allowed_models=_serialize_allowed_models(allowed_models) if payload.allowed_models_set else _UNSET,
+                enforced_model=enforced_model if payload.enforced_model_set else _UNSET,
+                enforced_reasoning_effort=(
+                    enforced_reasoning_effort if payload.enforced_reasoning_effort_set else _UNSET
+                ),
+                enforced_service_tier=enforced_service_tier if payload.enforced_service_tier_set else _UNSET,
+                expires_at=payload.expires_at if payload.expires_at_set else _UNSET,
+                is_active=(payload.is_active if payload.is_active_set and payload.is_active is not None else _UNSET),
+                owner_scope_user_id=owner_scope_user_id,
+                commit=False,
+            )
             if row is None:
                 raise ApiKeyNotFoundError(f"API key not found: {key_id}")
+
+            if payload.assigned_account_ids_set:
+                updated = await self._repository.replace_account_assignments(
+                    key_id,
+                    payload.assigned_account_ids or [],
+                    commit=False,
+                )
+                if not updated:
+                    raise ApiKeyNotFoundError(f"API key not found: {key_id}")
+
+            if payload.limits_set:
+                now = utcnow()
+                existing_limits = await self._repository.get_limits_by_key(key_id)
+                submitted_limits = payload.limits or []
+                limit_rows = _build_limit_rows_for_update(
+                    key_id=key_id,
+                    now=now,
+                    submitted_limits=submitted_limits,
+                    existing_limits=existing_limits,
+                    reset_usage=payload.reset_usage,
+                )
+                await self._repository.upsert_limits(key_id, limit_rows, commit=False)
+            elif payload.reset_usage:
+                now = utcnow()
+                existing_limits = await self._repository.get_limits_by_key(key_id)
+                limit_rows = _build_reset_limit_rows(key_id=key_id, now=now, existing_limits=existing_limits)
+                await self._repository.upsert_limits(key_id, limit_rows, commit=False)
+
+            await self._repository.commit()
+        except Exception:
+            await self._repository.rollback()
+            raise
+
+        row = await self._repository.get_by_id(key_id, owner_user_id=owner_scope_user_id)
+        if row is None:
+            raise ApiKeyNotFoundError(f"API key not found: {key_id}")
 
         return _to_api_key_data(row)
 
@@ -470,7 +539,9 @@ class ApiKeysService:
         input_tokens: int,
         output_tokens: int,
         cached_input_tokens: int = 0,
+        service_tier: str | None = None,
     ) -> None:
+        del service_tier
         reservation = await self._repository.get_usage_reservation(reservation_id)
         if reservation is None or reservation.status != "reserved":
             return
@@ -605,11 +676,16 @@ def _hash_key(plain_key: str) -> str:
     return sha256(plain_key.encode("utf-8")).hexdigest()
 
 
+def _normalize_allowed_models(allowed_models: list[str] | None) -> list[str] | None:
+    if allowed_models is None:
+        return None
+    return [model.strip() for model in allowed_models if model and model.strip()]
+
+
 def _serialize_allowed_models(allowed_models: list[str] | None) -> str | None:
     if allowed_models is None:
         return None
-    normalized = [model.strip() for model in allowed_models if model and model.strip()]
-    return json.dumps(normalized)
+    return json.dumps(_normalize_allowed_models(allowed_models) or [])
 
 
 def _deserialize_allowed_models(payload: str | None) -> list[str] | None:
@@ -620,6 +696,42 @@ def _deserialize_allowed_models(payload: str | None) -> list[str] | None:
         return None
     models = [str(value).strip() for value in parsed if str(value).strip()]
     return models
+
+
+def _normalize_optional_string(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _normalize_enforced_reasoning_effort(value: str | None) -> str | None:
+    normalized = _normalize_optional_string(value)
+    if normalized is None:
+        return None
+    lowered = normalized.lower()
+    if lowered == "none":
+        return None
+    return lowered
+
+
+def _normalize_enforced_service_tier(value: str | None) -> str | None:
+    normalized = _normalize_optional_string(value)
+    if normalized is None:
+        return None
+    lowered = normalized.lower()
+    if lowered == "none":
+        return None
+    if lowered == "fast":
+        return "priority"
+    return lowered
+
+
+def _validate_enforced_model_allowed(enforced_model: str | None, allowed_models: list[str] | None) -> None:
+    if enforced_model is None or not allowed_models:
+        return
+    if enforced_model not in allowed_models:
+        raise ValueError("Enforced model must be included in allowed models")
 
 
 def _to_limit_rule_data(limit: ApiKeyLimit) -> LimitRuleData:
