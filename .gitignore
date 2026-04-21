@@ -20,6 +20,7 @@ __pycache__/
 build/
 dist/
 app/static/
+deploy/helm/*/charts/
 
 # Node
 node_modules/
@@ -41,5 +42,14 @@ frontend/coverage/
 certs/
 
 .codex-lb/
+.sisyphus/
 
 .specstory/
+
+.agents/hooks/state/
+.agents/.personality_migration
+.agents/version.json
+.agents/log/
+.venv
+
+.omx/

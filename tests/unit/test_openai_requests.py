@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from typing import Mapping, cast
+
 import pytest
 from pydantic import ValidationError
 
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRequest
+from app.core.types import JsonValue
 
 
 def test_responses_requires_instructions():
@@ -18,10 +21,10 @@ def test_responses_requires_input():
         ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi"})
 
 
-def test_store_true_is_rejected():
+def test_store_true_is_coerced_to_false():
     payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "store": True}
-    with pytest.raises(ValueError, match="store must be false"):
-        ResponsesRequest.model_validate(payload)
+    request = ResponsesRequest.model_validate(payload)
+    assert request.store is False
 
 
 def test_store_omitted_defaults_to_false():
@@ -39,12 +42,162 @@ def test_store_false_is_preserved():
     assert request.to_payload()["store"] is False
 
 
-def test_extra_fields_are_preserved():
-    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "max_output_tokens": 32000}
+def test_compact_store_true_is_coerced_to_false():
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "store": True}
+    request = ResponsesCompactRequest.model_validate(payload)
+    assert request.store is False
+
+
+def test_compact_store_omitted_defaults_to_false():
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": []}
+    request = ResponsesCompactRequest.model_validate(payload)
+
+    assert request.store is False
+    assert "store" not in request.to_payload()
+
+
+def test_compact_store_false_is_preserved():
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "store": False}
+    request = ResponsesCompactRequest.model_validate(payload)
+
+    assert request.store is False
+    assert "store" not in request.to_payload()
+
+
+def test_known_unsupported_upstream_fields_are_stripped():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "max_output_tokens": 32000,
+        "prompt_cache_retention": "4h",
+        "safety_identifier": "safe_123",
+        "temperature": 0.2,
+        "custom_field": "kept",
+    }
     request = ResponsesRequest.model_validate(payload)
 
     dumped = request.to_payload()
     assert "max_output_tokens" not in dumped
+    assert "prompt_cache_retention" not in dumped
+    assert "safety_identifier" not in dumped
+    assert "temperature" not in dumped
+    assert dumped["custom_field"] == "kept"
+
+
+def test_responses_preserves_service_tier():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "service_tier": "priority",
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    dumped = request.to_payload()
+    assert dumped["service_tier"] == "priority"
+
+
+def test_responses_normalizes_fast_service_tier_to_priority_for_upstream():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "service_tier": "fast",
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.service_tier == "priority"
+    dumped = request.to_payload()
+    assert dumped["service_tier"] == "priority"
+
+
+def test_compact_known_unsupported_upstream_fields_are_stripped():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "prompt_cache_retention": "4h",
+        "safety_identifier": "safe_123",
+        "temperature": 0.2,
+    }
+    request = ResponsesCompactRequest.model_validate(payload)
+
+    dumped = request.to_payload()
+    assert "prompt_cache_retention" not in dumped
+    assert "safety_identifier" not in dumped
+    assert "temperature" not in dumped
+
+
+def test_compact_normalizes_fast_service_tier_to_priority_for_upstream():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "service_tier": "fast",
+    }
+    request = ResponsesCompactRequest.model_validate(payload)
+
+    assert request.service_tier == "priority"
+    dumped = request.to_payload()
+    assert dumped["service_tier"] == "priority"
+
+
+def test_openai_prompt_cache_aliases_are_normalized():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "promptCacheKey": "thread_123",
+        "promptCacheRetention": "4h",
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    dumped = request.to_payload()
+    assert dumped["prompt_cache_key"] == "thread_123"
+    assert "prompt_cache_retention" not in dumped
+    assert "promptCacheKey" not in dumped
+    assert "promptCacheRetention" not in dumped
+
+
+def test_settings_default_prompt_cache_affinity_ttl_is_1800():
+    from app.core.config.settings import Settings
+
+    settings = Settings()
+
+    assert settings.openai_cache_affinity_max_age_seconds == 1800
+
+
+def test_responses_to_payload_canonicalizes_tool_order_and_object_keys():
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "hi",
+            "input": [],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "zeta",
+                    "parameters": {"required": [], "type": "object", "properties": {}},
+                    "description": "later",
+                },
+                {
+                    "description": "first",
+                    "parameters": {"properties": {}, "required": [], "type": "object"},
+                    "type": "function",
+                    "name": "alpha",
+                },
+            ],
+        }
+    )
+
+    dumped = request.to_payload()
+    tools = cast(list[JsonValue], dumped["tools"])
+    first_tool = cast(Mapping[str, JsonValue], tools[0])
+    parameters = cast(Mapping[str, JsonValue], first_tool["parameters"])
+    assert first_tool["name"] == "alpha"
+    assert list(first_tool.keys()) == ["description", "name", "parameters", "type"]
+    assert list(parameters.keys()) == ["properties", "required", "type"]
 
 
 def test_openai_compatible_reasoning_aliases_are_normalized():
@@ -89,6 +242,31 @@ def test_openai_compatible_top_level_verbosity_is_normalized():
     dumped = request.to_payload()
     assert dumped["text"] == {"verbosity": "medium"}
     assert "verbosity" not in dumped
+
+
+def test_v1_responses_preserves_service_tier():
+    payload = {
+        "model": "gpt-5.1",
+        "input": "hello",
+        "service_tier": "priority",
+    }
+    request = V1ResponsesRequest.model_validate(payload).to_responses_request()
+
+    dumped = request.to_payload()
+    assert dumped["service_tier"] == "priority"
+
+
+def test_v1_responses_normalizes_fast_service_tier_to_priority_for_upstream():
+    payload = {
+        "model": "gpt-5.1",
+        "input": "hello",
+        "service_tier": "fast",
+    }
+    request = V1ResponsesRequest.model_validate(payload).to_responses_request()
+
+    assert request.service_tier == "priority"
+    dumped = request.to_payload()
+    assert dumped["service_tier"] == "priority"
 
 
 def test_interleaved_reasoning_fields_are_sanitized_from_input():
@@ -192,6 +370,33 @@ def test_responses_accepts_builtin_tools(tool_type, expected):
     assert request.tools == [{"type": expected}]
 
 
+@pytest.mark.parametrize(
+    "tool_payload",
+    [
+        {"type": "image_generation"},
+        {
+            "type": "computer_use_preview",
+            "display_width": 1024,
+            "display_height": 768,
+            "environment": "browser",
+        },
+        {"type": "computer_use", "display_width": 1024, "display_height": 768, "environment": "browser"},
+        {"type": "file_search", "vector_store_ids": ["vs_dummy"]},
+        {"type": "code_interpreter", "container": {"type": "auto"}},
+    ],
+)
+def test_responses_accepts_builtin_tool_passthrough(tool_payload):
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "tools": [tool_payload],
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.tools == [tool_payload]
+
+
 @pytest.mark.parametrize("tool_choice", [{"type": "web_search"}, {"type": "web_search_preview"}])
 def test_responses_normalizes_tool_choice_web_search_preview(tool_choice):
     payload = {
@@ -227,6 +432,19 @@ def test_responses_accepts_known_include_values():
     assert request.include == ["reasoning.encrypted_content", "web_search_call.action.sources"]
 
 
+def test_responses_accepts_previous_response_id_without_conversation():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "previous_response_id": "  resp_1  ",
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.previous_response_id == "resp_1"
+    assert request.to_payload()["previous_response_id"] == "resp_1"
+
+
 def test_responses_rejects_conversation_previous_response_id():
     payload = {
         "model": "gpt-5.1",
@@ -235,7 +453,7 @@ def test_responses_rejects_conversation_previous_response_id():
         "conversation": "conv_1",
         "previous_response_id": "resp_1",
     }
-    with pytest.raises(ValueError, match="previous_response_id is not supported"):
+    with pytest.raises(ValueError, match="either 'conversation' or 'previous_response_id'"):
         ResponsesRequest.model_validate(payload)
 
 
@@ -293,10 +511,59 @@ def test_v1_input_string_passthrough():
     assert request.input == [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
 
 
-def test_v1_rejects_builtin_tools():
-    payload = {"model": "gpt-5.1", "input": [], "tools": [{"type": "image_generation"}]}
-    with pytest.raises(ValidationError, match="Unsupported tool type"):
-        V1ResponsesRequest.model_validate(payload)
+@pytest.mark.parametrize(
+    "tool_payload",
+    [
+        {"type": "image_generation"},
+        {
+            "type": "computer_use_preview",
+            "display_width": 1024,
+            "display_height": 768,
+            "environment": "browser",
+        },
+        {"type": "computer_use", "display_width": 1024, "display_height": 768, "environment": "browser"},
+        {"type": "file_search", "vector_store_ids": ["vs_dummy"]},
+        {"type": "code_interpreter", "container": {"type": "auto"}},
+    ],
+)
+def test_v1_responses_accepts_builtin_tools(tool_payload):
+    payload = {"model": "gpt-5.1", "input": [], "tools": [tool_payload]}
+    request = V1ResponsesRequest.model_validate(payload).to_responses_request()
+
+    assert request.tools == [tool_payload]
+
+
+def test_compact_strips_tool_fields():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "tools": [{"type": "image_generation"}],
+        "tool_choice": {"type": "image_generation"},
+        "parallel_tool_calls": True,
+    }
+    request = ResponsesCompactRequest.model_validate(payload)
+
+    dumped = request.to_payload()
+    assert "tools" not in dumped
+    assert "tool_choice" not in dumped
+    assert "parallel_tool_calls" not in dumped
+
+
+def test_v1_compact_strips_tool_fields():
+    payload = {
+        "model": "gpt-5.1",
+        "input": "hello",
+        "tools": [{"type": "image_generation"}],
+        "tool_choice": {"type": "image_generation"},
+        "parallel_tool_calls": True,
+    }
+    request = V1ResponsesCompactRequest.model_validate(payload).to_compact_request()
+
+    dumped = request.to_payload()
+    assert "tools" not in dumped
+    assert "tool_choice" not in dumped
+    assert "parallel_tool_calls" not in dumped
 
 
 def test_v1_compact_messages_convert():
@@ -316,6 +583,33 @@ def test_v1_compact_input_string_passthrough():
     request = V1ResponsesCompactRequest.model_validate(payload).to_compact_request()
 
     assert request.input == [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
+
+
+def test_v1_compact_reasoning_passthrough():
+    payload = {
+        "model": "gpt-5.1",
+        "input": "hello",
+        "reasoning": {"effort": "high"},
+    }
+    request = V1ResponsesCompactRequest.model_validate(payload).to_compact_request()
+
+    assert request.reasoning is not None
+    assert request.reasoning.effort == "high"
+
+
+def test_v1_compact_store_omitted_defaults_to_false():
+    payload = {"model": "gpt-5.1", "input": "hello"}
+    request = V1ResponsesCompactRequest.model_validate(payload).to_compact_request()
+
+    assert request.store is False
+    assert "store" not in request.to_payload()
+
+
+def test_v1_compact_store_true_is_coerced_to_false():
+    payload = {"model": "gpt-5.1", "input": "hello", "store": True}
+    request = V1ResponsesCompactRequest.model_validate(payload)
+    compact = request.to_compact_request()
+    assert compact.store is False
 
 
 def test_responses_normalizes_assistant_input_text_to_output_text():

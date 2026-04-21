@@ -6,8 +6,9 @@ import json
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
+import app.modules.proxy.load_balancer as load_balancer_module
 import app.modules.proxy.service as proxy_module
 from app.core.auth import generate_unique_account_id
 from app.core.clients.proxy import ProxyResponseError
@@ -46,10 +47,10 @@ def _make_upstream_model(slug: str, *, supported_in_api: bool = True) -> Upstrea
     )
 
 
-def _populate_test_registry() -> None:
+async def _populate_test_registry() -> None:
     registry = get_model_registry()
     models = [_make_upstream_model(slug) for slug in _TEST_MODELS]
-    registry.update({"plus": models, "pro": models})
+    await registry.update({"plus": models, "pro": models})
 
 
 def _encode_jwt(payload: dict) -> str:
@@ -98,6 +99,8 @@ async def test_api_keys_crud_and_regenerate(async_client):
     payload = create.json()
     assert payload["name"] == "dev-key"
     assert payload["key"].startswith("sk-clb-")
+    assert payload["accountAssignmentScopeEnabled"] is False
+    assert payload["assignedAccountIds"] == []
     assert len(payload["limits"]) == 1
     assert payload["limits"][0]["limitType"] == "total_tokens"
     assert payload["limits"][0]["maxValue"] == 1000
@@ -111,6 +114,8 @@ async def test_api_keys_crud_and_regenerate(async_client):
     assert len(rows) == 1
     assert rows[0]["id"] == key_id
     assert "key" not in rows[0]
+    assert rows[0]["accountAssignmentScopeEnabled"] is False
+    assert rows[0]["assignedAccountIds"] == []
     assert len(rows[0]["limits"]) == 1
 
     updated = await async_client.patch(
@@ -138,6 +143,183 @@ async def test_api_keys_crud_and_regenerate(async_client):
     listed_after_delete = await async_client.get("/api/api-keys/")
     assert listed_after_delete.status_code == 200
     assert listed_after_delete.json() == []
+
+
+@pytest.mark.asyncio
+async def test_api_key_update_persists_assigned_account_ids(async_client):
+    first_account_id = await _import_account(async_client, "acc-assigned-a", "assigned-a@example.com")
+    second_account_id = await _import_account(async_client, "acc-assigned-b", "assigned-b@example.com")
+
+    create = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "assigned-key",
+        },
+    )
+    assert create.status_code == 200
+    key_id = create.json()["id"]
+
+    update = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={"assignedAccountIds": [first_account_id, second_account_id]},
+    )
+    assert update.status_code == 200
+    assert update.json()["accountAssignmentScopeEnabled"] is True
+    assert update.json()["assignedAccountIds"] == [first_account_id, second_account_id]
+
+    listed = await async_client.get("/api/api-keys/")
+    assert listed.status_code == 200
+    assert listed.json()[0]["accountAssignmentScopeEnabled"] is True
+    assert listed.json()[0]["assignedAccountIds"] == [first_account_id, second_account_id]
+
+    cleared = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={"assignedAccountIds": []},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["accountAssignmentScopeEnabled"] is False
+    assert cleared.json()["assignedAccountIds"] == []
+
+
+@pytest.mark.asyncio
+async def test_deleted_assigned_accounts_do_not_fall_back_to_other_accounts(async_client, monkeypatch):
+    await _populate_test_registry()
+    monkeypatch.setattr(load_balancer_module, "_filter_accounts_for_model", lambda accounts, model: accounts)
+    assigned_account_id = await _import_account(async_client, "acc-scoped", "scoped@example.com")
+    await _import_account(async_client, "acc-fallback", "fallback@example.com")
+
+    settings = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert settings.status_code == 200
+
+    create = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "deleted-scope-key"},
+    )
+    assert create.status_code == 200
+    key_id = create.json()["id"]
+    key = create.json()["key"]
+
+    update = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={"assignedAccountIds": [assigned_account_id]},
+    )
+    assert update.status_code == 200
+
+    delete = await async_client.delete(f"/api/accounts/{assigned_account_id}")
+    assert delete.status_code == 200
+
+    listed = await async_client.get("/api/api-keys/")
+    assert listed.status_code == 200
+    assert listed.json()[0]["assignedAccountIds"] == []
+    assert listed.json()[0]["accountAssignmentScopeEnabled"] is True
+
+    called = False
+
+    async def fake_compact(payload, headers, access_token, account_id):
+        del payload, headers, access_token, account_id
+        nonlocal called
+        called = True
+        return OpenAIResponsePayload.model_validate({"output": []})
+
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
+
+    response = await async_client.post(
+        "/backend-api/codex/responses/compact",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": _TEST_MODELS[0], "instructions": "hi", "input": []},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "no_accounts"
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_api_key_update_rejects_unknown_assigned_account_ids(async_client):
+    create = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "invalid-assignment-key"},
+    )
+    assert create.status_code == 200
+
+    update = await async_client.patch(
+        f"/api/api-keys/{create.json()['id']}",
+        json={"assignedAccountIds": ["missing-account"]},
+    )
+    assert update.status_code == 400
+    assert update.json()["error"]["code"] == "invalid_api_key_payload"
+
+
+@pytest.mark.asyncio
+async def test_api_key_update_does_not_persist_assignments_when_limits_are_invalid(async_client):
+    assigned_account_id = await _import_account(async_client, "acc-atomic", "atomic@example.com")
+
+    create = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "atomic-assignment-key"},
+    )
+    assert create.status_code == 200
+    key_id = create.json()["id"]
+
+    update = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={
+            "assignedAccountIds": [assigned_account_id],
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "daily", "maxValue": 100},
+                {"limitType": "total_tokens", "limitWindow": "daily", "maxValue": 200},
+            ],
+        },
+    )
+    assert update.status_code == 400
+    assert update.json()["error"]["code"] == "invalid_api_key_payload"
+
+    listed = await async_client.get("/api/api-keys/")
+    assert listed.status_code == 200
+    assert listed.json()[0]["assignedAccountIds"] == []
+
+
+@pytest.mark.asyncio
+async def test_api_key_update_rolls_back_base_fields_when_assignment_write_fails(async_client, monkeypatch):
+    assigned_account_id = await _import_account(async_client, "acc-rollback", "rollback@example.com")
+
+    create = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "rollback-assignment-key"},
+    )
+    assert create.status_code == 200
+    key_id = create.json()["id"]
+
+    original_replace = ApiKeysRepository.replace_account_assignments
+
+    async def fail_replace_account_assignments(self, key_id: str, account_ids: list[str], *, commit: bool = True):
+        del account_ids, commit
+        await original_replace(self, key_id, [], commit=False)
+        raise RuntimeError("simulated assignment write failure")
+
+    monkeypatch.setattr(ApiKeysRepository, "replace_account_assignments", fail_replace_account_assignments)
+
+    with pytest.raises(RuntimeError, match="simulated assignment write failure"):
+        await async_client.patch(
+            f"/api/api-keys/{key_id}",
+            json={
+                "name": "should-not-persist",
+                "assignedAccountIds": [assigned_account_id],
+            },
+        )
+
+    listed = await async_client.get("/api/api-keys/")
+    assert listed.status_code == 200
+    assert listed.json()[0]["name"] == "rollback-assignment-key"
+    assert listed.json()[0]["assignedAccountIds"] == []
 
 
 @pytest.mark.asyncio
@@ -195,7 +377,7 @@ async def test_api_keys_update_limits(async_client):
 
 @pytest.mark.asyncio
 async def test_api_key_model_restriction_and_models_filter(async_client):
-    _populate_test_registry()
+    await _populate_test_registry()
     model_ids = sorted(_TEST_MODELS)
     assert len(model_ids) >= 2
     allowed_model = model_ids[0]
@@ -234,6 +416,261 @@ async def test_api_key_model_restriction_and_models_filter(async_client):
     )
     assert blocked.status_code == 403
     assert blocked.json()["error"]["code"] == "model_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_api_key_rejects_enforced_model_outside_allowed_models(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "invalid-enforcement",
+            "allowedModels": ["model-alpha"],
+            "enforcedModel": "model-beta",
+        },
+    )
+    assert created.status_code == 400
+    assert created.json()["error"]["code"] == "invalid_api_key_payload"
+
+
+@pytest.mark.asyncio
+async def test_api_key_create_accepts_fast_service_tier_alias(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "fast-tier-key",
+            "enforcedServiceTier": "fast",
+        },
+    )
+
+    assert created.status_code == 200
+    assert created.json()["enforcedServiceTier"] == "priority"
+
+
+@pytest.mark.asyncio
+async def test_api_key_update_accepts_fast_service_tier_alias(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "fast-tier-update-key",
+        },
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+
+    updated = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={
+            "enforcedServiceTier": "fast",
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["enforcedServiceTier"] == "priority"
+
+
+@pytest.mark.asyncio
+async def test_api_key_enforces_model_and_reasoning_for_responses(async_client, monkeypatch):
+    await _populate_test_registry()
+    model_ids = sorted(_TEST_MODELS)
+    forced_model = model_ids[0]
+    requested_model = model_ids[1]
+
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "enforced-policy",
+            "allowedModels": [forced_model],
+            "enforcedModel": forced_model,
+            "enforcedReasoningEffort": "high",
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    models = await async_client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+    assert models.status_code == 200
+    assert [item["id"] for item in models.json()["data"]] == [forced_model]
+
+    await _import_account(async_client, "acc_enforced_key", "enforced-key@example.com")
+
+    seen: dict[str, str | None] = {}
+
+    async def fake_stream(payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
+        seen["model"] = payload.model
+        seen["effort"] = payload.reasoning.effort if payload.reasoning else None
+        usage = {"input_tokens": 3, "output_tokens": 2}
+        event = {"type": "response.completed", "response": {"id": "resp_enforced", "usage": usage}}
+        yield f"data: {json.dumps(event)}\n\n"
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": requested_model,
+            "instructions": "hi",
+            "input": [],
+            "reasoning": {"effort": "low"},
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines() if line]
+
+    assert seen["model"] == forced_model
+    assert seen["effort"] == "high"
+
+    async with SessionLocal() as session:
+        result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
+        latest_log = result.scalars().first()
+        assert latest_log is not None
+    assert latest_log.model == forced_model
+    assert latest_log.reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_api_key_enforces_service_tier_for_responses(async_client, monkeypatch):
+    await _populate_test_registry()
+    model_ids = sorted(_TEST_MODELS)
+    forced_model = model_ids[0]
+
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "enforced-service-tier",
+            "allowedModels": [forced_model],
+            "enforcedModel": forced_model,
+            "enforcedServiceTier": "fast",
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+    assert created.json()["enforcedServiceTier"] == "priority"
+
+    await _import_account(async_client, "acc_enforced_service_tier", "enforced-service-tier@example.com")
+
+    seen: dict[str, str | None] = {}
+
+    async def fake_stream(payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
+        seen["service_tier"] = payload.service_tier
+        usage = {"input_tokens": 3, "output_tokens": 2}
+        event = {"type": "response.completed", "response": {"id": "resp_enforced_service_tier", "usage": usage}}
+        yield f"data: {json.dumps(event)}\n\n"
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": forced_model,
+            "instructions": "hi",
+            "input": [],
+            "service_tier": "default",
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines() if line]
+
+    assert seen["service_tier"] == "priority"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/backend-api/codex/responses/compact", "/v1/responses/compact"])
+async def test_api_key_enforces_model_and_reasoning_for_compact_responses(async_client, monkeypatch, endpoint):
+    await _populate_test_registry()
+    model_ids = sorted(_TEST_MODELS)
+    forced_model = model_ids[0]
+    requested_model = model_ids[1]
+
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "enforced-compact-policy",
+            "allowedModels": [forced_model],
+            "enforcedModel": forced_model,
+            "enforcedReasoningEffort": "high",
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    await _import_account(async_client, "acc_enforced_compact_key", "enforced-compact-key@example.com")
+
+    seen: dict[str, str | None] = {}
+
+    async def fake_compact(payload, _headers, _access_token, _account_id):
+        seen["model"] = payload.model
+        seen["effort"] = payload.reasoning.effort if payload.reasoning else None
+        return OpenAIResponsePayload.model_validate(
+            {
+                "id": "resp_compact_enforced",
+                "model": payload.model,
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 3,
+                    "output_tokens": 2,
+                    "reasoning_tokens": 4,
+                    "total_tokens": 9,
+                },
+                "output": [],
+            }
+        )
+
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
+
+    response = await async_client.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": requested_model,
+            "instructions": "hi",
+            "input": [],
+            "reasoning": {"effort": "low"},
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["model"] == forced_model
+
+    assert seen["model"] == forced_model
+    assert seen["effort"] == "high"
 
 
 @pytest.mark.asyncio
@@ -301,6 +738,359 @@ async def test_api_key_usage_tracking_and_request_log_link(async_client, monkeyp
         latest_log = result.scalars().first()
         assert latest_log is not None
         assert latest_log.api_key_id == key_id
+
+    listed = await async_client.get("/api/api-keys/")
+    assert listed.status_code == 200
+    listed_rows = listed.json()
+    usage_key_row = next((row for row in listed_rows if row["id"] == key_id), None)
+    assert usage_key_row is not None
+    assert usage_key_row["usageSummary"] is not None
+    assert usage_key_row["usageSummary"]["requestCount"] == 1
+    assert usage_key_row["usageSummary"]["totalTokens"] == 15
+    assert usage_key_row["usageSummary"]["cachedInputTokens"] == 0
+    assert usage_key_row["usageSummary"]["totalCostUsd"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_api_key_usage_summary_cost_respects_service_tier(async_client, monkeypatch):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "priority-usage-summary",
+            "limits": [
+                {"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 100_000_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    key = payload["key"]
+    key_id = payload["id"]
+
+    await _import_account(async_client, "acc_priority_usage_summary", "priority-usage-summary@example.com")
+
+    async def fake_stream(_payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_priority_usage_summary",
+                "status": "completed",
+                "service_tier": "priority",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "total_tokens": 2_000_000,
+                },
+            },
+        }
+        yield f"data: {json.dumps(event)}\n\n"
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "input": [],
+            "stream": True,
+            "service_tier": "priority",
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines() if line]
+
+    listed = await async_client.get("/api/api-keys/")
+    assert listed.status_code == 200
+    listed_rows = listed.json()
+    usage_key_row = next((row for row in listed_rows if row["id"] == key_id), None)
+    assert usage_key_row is not None
+    assert usage_key_row["usageSummary"] is not None
+    assert usage_key_row["usageSummary"]["totalCostUsd"] == pytest.approx(35.0, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_api_key_usage_summary_uses_persisted_request_log_cost(async_client, monkeypatch):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "persisted-usage-summary",
+            "limits": [
+                {"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 100_000_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    key = payload["key"]
+    key_id = payload["id"]
+
+    await _import_account(async_client, "acc_persisted_usage_summary", "persisted-usage-summary@example.com")
+
+    async def fake_stream(_payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_persisted_usage_summary",
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15,
+                },
+            },
+        }
+        yield f"data: {json.dumps(event)}\n\n"
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "gpt-5.1",
+            "instructions": "hi",
+            "input": [],
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines() if line]
+
+    async with SessionLocal() as session:
+        result = await session.execute(select(RequestLog).where(RequestLog.api_key_id == key_id))
+        log = result.scalar_one()
+        await session.execute(update(RequestLog).where(RequestLog.id == log.id).values(cost_usd=7.654321))
+        await session.commit()
+
+    listed = await async_client.get("/api/api-keys/")
+    assert listed.status_code == 200
+    listed_rows = listed.json()
+    usage_key_row = next((row for row in listed_rows if row["id"] == key_id), None)
+    assert usage_key_row is not None
+    assert usage_key_row["usageSummary"] is not None
+    assert usage_key_row["usageSummary"]["totalCostUsd"] == pytest.approx(7.654321, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_api_key_create_accepts_uppercase_enforced_reasoning(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "uppercase-enforcement",
+            "enforcedReasoningEffort": "HIGH",
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["enforcedReasoningEffort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_api_key_update_accepts_uppercase_enforced_reasoning(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "uppercase-enforcement-update",
+        },
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+
+    updated = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={
+            "enforcedReasoningEffort": "HIGH",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["enforcedReasoningEffort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_stream_usage_logs_actual_service_tier(async_client, monkeypatch):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "stream-actual-tier-key",
+            "limits": [
+                {"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 100_000_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    key = payload["key"]
+    key_id = payload["id"]
+
+    await _import_account(async_client, "acc_stream_actual_tier", "stream-actual-tier@example.com")
+
+    async def fake_stream(_payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_stream_actual_tier",
+                "status": "completed",
+                "service_tier": "default",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "total_tokens": 2_000_000,
+                },
+            },
+        }
+        yield f"data: {json.dumps(event)}\n\n"
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "input": [],
+            "stream": True,
+            "service_tier": "priority",
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines() if line]
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].current_value == 27_500_000
+
+        result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
+        latest_log = result.scalars().first()
+        assert latest_log is not None
+        assert latest_log.api_key_id == key_id
+        assert latest_log.requested_service_tier == "priority"
+        assert latest_log.actual_service_tier == "default"
+        assert latest_log.service_tier == "default"
+
+
+@pytest.mark.asyncio
+async def test_stream_usage_logs_actual_service_tier_when_response_created_echoes_default(async_client, monkeypatch):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "stream-created-tier-key",
+            "limits": [
+                {"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 100_000_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    key = payload["key"]
+    key_id = payload["id"]
+
+    await _import_account(async_client, "acc_stream_created_tier", "stream-created-tier@example.com")
+
+    async def fake_stream(_payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
+        created_event = {
+            "type": "response.created",
+            "response": {
+                "id": "resp_stream_created_tier",
+                "status": "in_progress",
+                "service_tier": "default",
+            },
+        }
+        completed_event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_stream_created_tier",
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "total_tokens": 2_000_000,
+                },
+            },
+        }
+        yield f"data: {json.dumps(created_event)}\n\n"
+        yield f"data: {json.dumps(completed_event)}\n\n"
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "input": [],
+            "stream": True,
+            "service_tier": "priority",
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines() if line]
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].current_value == 27_500_000
+
+        result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
+        latest_log = result.scalars().first()
+        assert latest_log is not None
+        assert latest_log.api_key_id == key_id
+        assert latest_log.requested_service_tier == "priority"
+        assert latest_log.actual_service_tier == "default"
+        assert latest_log.service_tier == "default"
 
 
 @pytest.mark.asyncio
@@ -380,6 +1170,383 @@ async def test_api_key_limit_applies_to_compact_responses(async_client, monkeypa
         limits = await repo.get_limits_by_key(key_id)
         assert len(limits) == 1
         assert limits[0].current_value == 12  # 7 input + 5 output
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_stream_finalizes_token_limit(async_client, monkeypatch):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "chat-completions-token-limit",
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 10},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    key = payload["key"]
+    key_id = payload["id"]
+
+    await _import_account(async_client, "acc_chat_token_limit", "chat-token-limit@example.com")
+
+    seen = {"calls": 0}
+
+    async def fake_stream(_payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
+        seen["calls"] += 1
+        yield 'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_chat_token_limit","usage":'
+            '{"input_tokens":7,"output_tokens":5,"total_tokens":12}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": _TEST_MODELS[0],
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines() if line]
+
+    blocked = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": _TEST_MODELS[0],
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        },
+    )
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "rate_limit_exceeded"
+    assert seen["calls"] == 1
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].current_value == 12
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_stream_finalizes_cost_limit(async_client, monkeypatch):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "chat-completions-cost-limit",
+            "limits": [
+                {"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 20_000_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    key = payload["key"]
+    key_id = payload["id"]
+
+    await _import_account(async_client, "acc_chat_cost_limit", "chat-cost-limit@example.com")
+
+    seen = {"calls": 0}
+
+    async def fake_stream(_payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
+        seen["calls"] += 1
+        yield 'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_chat_cost_limit","model":"gpt-5.4",'
+            '"service_tier":"default","usage":{"input_tokens":1000000,"output_tokens":1000000,'
+            '"total_tokens":2000000}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines() if line]
+
+    blocked = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        },
+    )
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "rate_limit_exceeded"
+    assert seen["calls"] == 1
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].current_value == 27_500_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/backend-api/codex/responses/compact", "/v1/responses/compact"])
+@pytest.mark.parametrize("requested_service_tier", ["priority", "fast"])
+async def test_compact_cost_limit_uses_canonical_request_service_tier_when_response_omits_echo(
+    async_client,
+    monkeypatch,
+    endpoint,
+    requested_service_tier,
+):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "compact-priority-cost-limit",
+            "limits": [
+                {"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 30_000_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    key = payload["key"]
+    key_id = payload["id"]
+
+    await _import_account(async_client, "acc_compact_priority_cost", "compact-priority-cost@example.com")
+
+    seen = {"calls": 0}
+
+    async def fake_compact(_payload, _headers, _access_token, _account_id):
+        seen["calls"] += 1
+        return OpenAIResponsePayload.model_validate(
+            {
+                "id": "resp_compact_priority_cost",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "total_tokens": 2_000_000,
+                },
+                "output": [],
+            }
+        )
+
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
+
+    request_payload = {
+        "model": "gpt-5.4",
+        "instructions": "hi",
+        "input": [],
+        "service_tier": requested_service_tier,
+    }
+
+    first = await async_client.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {key}"},
+        json=request_payload,
+    )
+    assert first.status_code == 200
+
+    blocked = await async_client.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {key}"},
+        json=request_payload,
+    )
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "rate_limit_exceeded"
+    assert seen["calls"] == 1
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].current_value == 35_000_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/backend-api/codex/responses/compact", "/v1/responses/compact"])
+async def test_compact_cost_limit_prefers_response_service_tier_over_request(
+    async_client,
+    monkeypatch,
+    endpoint,
+):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "compact-response-tier-cost-limit",
+            "limits": [
+                {"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 100_000_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    key = payload["key"]
+    key_id = payload["id"]
+
+    await _import_account(async_client, "acc_compact_response_tier", "compact-response-tier@example.com")
+
+    async def fake_compact(_payload, _headers, _access_token, _account_id):
+        return OpenAIResponsePayload.model_validate(
+            {
+                "id": "resp_compact_response_tier",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "service_tier": "default",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "total_tokens": 2_000_000,
+                },
+                "output": [],
+            }
+        )
+
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
+
+    response = await async_client.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "input": [],
+            "service_tier": "priority",
+        },
+    )
+    assert response.status_code == 200
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].current_value == 27_500_000
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_non_stream_finalizes_cost_limit(async_client, monkeypatch):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "v1-responses-cost-limit",
+            "limits": [
+                {"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 30_000_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    key = payload["key"]
+    key_id = payload["id"]
+
+    await _import_account(async_client, "acc_v1_responses_cost", "v1-responses-cost@example.com")
+
+    seen = {"calls": 0}
+
+    async def fake_stream(_payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
+        seen["calls"] += 1
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_v1_cost_limit","model":"gpt-5.4",'
+            '"status":"completed","service_tier":"default","usage":{"input_tokens":1000000,"output_tokens":1000000,'
+            '"total_tokens":2000000}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "gpt-5.4", "input": "hi"},
+    )
+    assert response.status_code == 200
+
+    second = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "gpt-5.4", "input": "hi"},
+    )
+    assert second.status_code == 200
+
+    blocked = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "gpt-5.4", "input": "hi"},
+    )
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "rate_limit_exceeded"
+    assert seen["calls"] == 2
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].current_value == 55_000_000
 
 
 @pytest.mark.asyncio
@@ -620,7 +1787,7 @@ async def test_model_scoped_limit_allows_other_models(async_client, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_model_scoped_limit_does_not_block_v1_models(async_client):
-    _populate_test_registry()
+    await _populate_test_registry()
 
     enable = await async_client.put(
         "/api/settings",
@@ -856,7 +2023,7 @@ async def test_allowed_but_unsupported_model_is_exposed(async_client):
         _make_upstream_model(_TEST_MODELS[0], supported_in_api=True),
         _make_upstream_model(_HIDDEN_MODEL, supported_in_api=False),
     ]
-    registry.update({"plus": models, "pro": models})
+    await registry.update({"plus": models, "pro": models})
 
     enable = await async_client.put(
         "/api/settings",
@@ -934,7 +2101,13 @@ async def test_stream_401_retry_success_finalizes_once(async_client, monkeypatch
         event = {"type": "response.completed", "response": {"id": "resp_retry", "usage": usage}}
         yield f"data: {json.dumps(event)}\n\n"
 
+    async def fake_ensure_fresh(self, account, force: bool = False):
+        if force:
+            account.chatgpt_account_id = "acc_401_retry_refreshed"
+        return account
+
     monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh", fake_ensure_fresh)
 
     async with async_client.stream(
         "POST",

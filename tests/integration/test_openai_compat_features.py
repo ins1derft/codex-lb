@@ -95,7 +95,17 @@ async def test_v1_responses_rejects_input_file_id(async_client):
 
 
 @pytest.mark.asyncio
-async def test_v1_responses_rejects_previous_response_id(async_client):
+async def test_v1_responses_accepts_previous_response_id(async_client, monkeypatch):
+    await _import_account(async_client, "acc_prev_response_id", "prev-response-id@example.com")
+    seen_previous_response_ids: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kw):
+        del headers, access_token, account_id, base_url, raise_for_status, _kw
+        seen_previous_response_ids.append(getattr(payload, "previous_response_id", None))
+        yield 'data: {"type":"response.completed","response":{"id":"resp_abc123"}}\n\n'
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
     payload = {
         "model": "gpt-5.2",
         "previous_response_id": "resp_abc123",
@@ -105,10 +115,11 @@ async def test_v1_responses_rejects_previous_response_id(async_client):
                 "content": [{"type": "input_text", "text": "Continue."}],
             }
         ],
+        "stream": True,
     }
     resp = await async_client.post("/v1/responses", json=payload)
-    assert resp.status_code == 400
-    assert resp.json()["error"]["type"] == "invalid_request_error"
+    assert resp.status_code == 200
+    assert seen_previous_response_ids == ["resp_abc123"]
 
 
 @pytest.mark.asyncio
@@ -126,7 +137,18 @@ async def test_v1_responses_rejects_previous_response_id(async_client):
         {"type": "image_generation"},
     ],
 )
-async def test_v1_responses_rejects_builtin_tools(async_client, tool_payload):
+async def test_v1_responses_forwards_builtin_tools(async_client, monkeypatch, tool_payload):
+    await _import_account(async_client, "acc_builtin_tools", "builtin-tools@example.com")
+
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del headers, access_token, account_id, base_url, raise_for_status
+        seen["payload"] = payload
+        yield _completed_event("resp_builtin_tools")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
     request_payload = {
         "model": "gpt-5.2",
         "input": [
@@ -139,8 +161,8 @@ async def test_v1_responses_rejects_builtin_tools(async_client, tool_payload):
     }
 
     resp = await async_client.post("/v1/responses", json=request_payload)
-    assert resp.status_code == 400
-    assert resp.json()["error"]["type"] == "invalid_request_error"
+    assert resp.status_code == 200
+    assert seen["payload"].tools == [tool_payload]
 
 
 @pytest.mark.asyncio
@@ -186,6 +208,102 @@ async def test_v1_responses_forwards_include_logprobs(async_client, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_v1_responses_preserves_prompt_cache_controls(async_client, monkeypatch):
+    await _import_account(async_client, "acc_prompt_cache_v1", "prompt-cache-v1@example.com")
+
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload.to_payload()
+        yield _completed_event("resp_prompt_cache_v1")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {
+        "model": "gpt-5.2",
+        "input": "cache me",
+        "prompt_cache_key": "thread_123",
+        "prompt_cache_retention": "4h",
+    }
+    resp = await async_client.post("/v1/responses", json=payload)
+    assert resp.status_code == 200
+    assert seen["payload"]["prompt_cache_key"] == "thread_123"
+    assert "prompt_cache_retention" not in seen["payload"]
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_normalizes_prompt_cache_aliases(async_client, monkeypatch):
+    await _import_account(async_client, "acc_prompt_cache_alias", "prompt-cache-alias@example.com")
+
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload.to_payload()
+        yield _completed_event("resp_prompt_cache_alias")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {
+        "model": "gpt-5.2",
+        "input": "cache me",
+        "promptCacheKey": "thread_alias",
+        "promptCacheRetention": "12h",
+    }
+    resp = await async_client.post("/v1/responses", json=payload)
+    assert resp.status_code == 200
+    assert seen["payload"]["prompt_cache_key"] == "thread_alias"
+    assert "prompt_cache_retention" not in seen["payload"]
+    assert "promptCacheKey" not in seen["payload"]
+    assert "promptCacheRetention" not in seen["payload"]
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_forwards_service_tier(async_client, monkeypatch):
+    await _import_account(async_client, "acc_backend_service_tier", "backend-service-tier@example.com")
+
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload
+        yield _completed_event("resp_backend_service_tier")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    request_payload = {
+        "model": "gpt-5.2",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Fast"}]}],
+        "service_tier": "priority",
+    }
+    resp = await async_client.post("/backend-api/codex/responses", json=request_payload)
+    assert resp.status_code == 200
+    assert seen["payload"].service_tier == "priority"
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_normalizes_fast_service_tier_for_upstream(async_client, monkeypatch):
+    await _import_account(async_client, "acc_backend_fast_tier", "backend-fast-tier@example.com")
+
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload.to_payload()
+        yield _completed_event("resp_backend_fast_tier")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    request_payload = {
+        "model": "gpt-5.2",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Fast"}]}],
+        "service_tier": "fast",
+    }
+    resp = await async_client.post("/backend-api/codex/responses", json=request_payload)
+    assert resp.status_code == 200
+    assert seen["payload"]["service_tier"] == "priority"
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_rejects_invalid_include(async_client):
     payload = {"model": "gpt-5.2", "input": "hi", "include": ["not_allowed"]}
     resp = await async_client.post("/v1/responses", json=payload)
@@ -193,10 +311,13 @@ async def test_v1_responses_rejects_invalid_include(async_client):
 
 
 @pytest.mark.asyncio
-async def test_v1_responses_rejects_store_true(async_client):
+async def test_v1_responses_coerces_store_true_to_false(async_client):
+    """store=true should be silently coerced to false (not rejected) so the
+    bridge path can later override it on the upstream payload."""
     payload = {"model": "gpt-5.2", "input": "hi", "store": True}
     resp = await async_client.post("/v1/responses", json=payload)
-    assert resp.status_code == 400
+    # 503 means it passed validation (no 400) but there are no upstream accounts in test
+    assert resp.status_code != 400
 
 
 @pytest.mark.asyncio
@@ -493,6 +614,30 @@ async def test_v1_chat_completions_normalizes_tools_and_tool_choice(async_client
 
 
 @pytest.mark.asyncio
+async def test_v1_chat_completions_does_not_enable_codex_session_affinity(async_client, monkeypatch):
+    await _import_account(async_client, "acc_chat_affinity_a", "chat-affinity-a@example.com")
+    await _import_account(async_client, "acc_chat_affinity_b", "chat-affinity-b@example.com")
+
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["account_id"] = account_id
+        seen["prompt_cache_key"] = getattr(payload, "prompt_cache_key", None)
+        yield _completed_event("resp_chat_affinity")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "Weather?"}],
+    }
+    resp = await async_client.post("/v1/chat/completions", json=payload, headers={"session_id": "chat-session-123"})
+    assert resp.status_code == 200
+    assert isinstance(seen["prompt_cache_key"], str)
+    assert seen["prompt_cache_key"]
+
+
+@pytest.mark.asyncio
 async def test_v1_chat_completions_maps_reasoning_effort(async_client, monkeypatch):
     await _import_account(async_client, "acc_chat_reason", "chat-reason@example.com")
 
@@ -513,3 +658,49 @@ async def test_v1_chat_completions_maps_reasoning_effort(async_client, monkeypat
     assert resp.status_code == 200
     assert seen["payload"].reasoning is not None
     assert seen["payload"].reasoning.effort == "low"
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_forwards_service_tier(async_client, monkeypatch):
+    await _import_account(async_client, "acc_chat_service_tier", "chat-service-tier@example.com")
+
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload
+        yield _completed_event("resp_chat_service_tier")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "Think fast."}],
+        "service_tier": "priority",
+    }
+    resp = await async_client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 200
+    assert seen["payload"].service_tier == "priority"
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_preserves_prompt_cache_controls(async_client, monkeypatch):
+    await _import_account(async_client, "acc_chat_prompt_cache", "chat-prompt-cache@example.com")
+
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload.to_payload()
+        yield _completed_event("resp_chat_prompt_cache")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "Cache this chat."}],
+        "prompt_cache_key": "chat_thread_123",
+        "prompt_cache_retention": "8h",
+    }
+    resp = await async_client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 200
+    assert seen["payload"]["prompt_cache_key"] == "chat_thread_123"
+    assert "prompt_cache_retention" not in seen["payload"]

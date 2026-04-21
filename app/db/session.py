@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,10 +11,11 @@ import anyio
 from anyio import to_thread
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.core.config.settings import get_settings
-from app.db.sqlite_utils import check_sqlite_integrity, sqlite_db_path_from_url
+from app.db.sqlite_utils import SqliteIntegrityCheckMode, check_sqlite_integrity, sqlite_db_path_from_url
 
 if TYPE_CHECKING:
     from app.db.migrate import MigrationRunResult, MigrationState
@@ -32,6 +34,26 @@ def _is_sqlite_url(url: str) -> bool:
 
 def _is_sqlite_memory_url(url: str) -> bool:
     return _is_sqlite_url(url) and ":memory:" in url
+
+
+def _postgres_async_connect_args(url: str) -> dict[str, int] | None:
+    if not url.startswith("postgresql+asyncpg://"):
+        return None
+    if not os.environ.get("CODEX_LB_TEST_DATABASE_URL"):
+        return None
+    return {"prepared_statement_cache_size": 0}
+
+
+def _postgres_async_engine_kwargs(url: str, *, background: bool) -> dict[str, object]:
+    connect_args = _postgres_async_connect_args(url)
+    kwargs: dict[str, object] = {"connect_args": connect_args or {}}
+    if os.environ.get("CODEX_LB_TEST_DATABASE_URL") and url.startswith("postgresql+asyncpg://"):
+        kwargs["poolclass"] = NullPool
+    else:
+        kwargs["pool_size"] = 3 if background else _settings.database_pool_size
+        kwargs["max_overflow"] = 2 if background else _settings.database_max_overflow
+        kwargs["pool_timeout"] = _settings.database_pool_timeout_seconds
+    return kwargs
 
 
 def _configure_sqlite_engine(engine: Engine, *, enable_wal: bool) -> None:
@@ -70,12 +92,13 @@ else:
     engine = create_async_engine(
         _settings.database_url,
         echo=False,
-        pool_size=_settings.database_pool_size,
-        max_overflow=_settings.database_max_overflow,
-        pool_timeout=_settings.database_pool_timeout_seconds,
+        **_postgres_async_engine_kwargs(_settings.database_url, background=False),
     )
 
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+_background_engine: AsyncEngine | None = None
+_background_session_factory: async_sessionmaker[AsyncSession] | None = None
 
 _T = TypeVar("_T")
 
@@ -105,9 +128,15 @@ def _ensure_sqlite_dir(url: str) -> None:
     Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
 
 
-async def _shielded(awaitable: Awaitable[_T]) -> _T:
+def _startup_sqlite_check_mode(raw_mode: str) -> SqliteIntegrityCheckMode | None:
+    if raw_mode == "off":
+        return None
+    return SqliteIntegrityCheckMode(raw_mode)
+
+
+async def _shielded(awaitable: Awaitable[object]) -> None:
     with anyio.CancelScope(shield=True):
-        return await awaitable
+        await awaitable
 
 
 async def _safe_rollback(session: AsyncSession) -> None:
@@ -129,10 +158,11 @@ async def _safe_close(session: AsyncSession) -> None:
 def _load_migration_entrypoints() -> tuple[
     Callable[[str], "MigrationState"],
     Callable[[str], Awaitable["MigrationRunResult"]],
+    Callable[[str], tuple[str, ...]],
 ]:
-    from app.db.migrate import inspect_migration_state, run_startup_migrations
+    from app.db.migrate import check_schema_drift, inspect_migration_state, run_startup_migrations
 
-    return inspect_migration_state, run_startup_migrations
+    return inspect_migration_state, run_startup_migrations, check_schema_drift
 
 
 def _load_sqlite_backup_creator() -> _SqliteBackupCreator:
@@ -141,10 +171,51 @@ def _load_sqlite_backup_creator() -> _SqliteBackupCreator:
     return create_sqlite_pre_migration_backup
 
 
+def init_background_db(url: str | None = None) -> None:
+    """Initialize separate DB pool for background tasks (smaller pool).
+
+    Args:
+        url: Database URL. If None, uses settings.database_url.
+    """
+    global _background_engine, _background_session_factory
+    db_url = url or _settings.database_url
+
+    if _is_sqlite_url(db_url):
+        is_sqlite_memory = _is_sqlite_memory_url(db_url)
+        if is_sqlite_memory:
+            # Reuse the main engine for in-memory SQLite — creating a second
+            # engine would open a separate, empty in-memory database with no
+            # schema, causing "no such table" errors in background tasks.
+            _background_engine = engine
+            _background_session_factory = SessionLocal
+            return
+        _background_engine = create_async_engine(
+            db_url,
+            echo=False,
+            pool_size=3,
+            max_overflow=2,
+            pool_timeout=_settings.database_pool_timeout_seconds,
+            connect_args={"timeout": _SQLITE_BUSY_TIMEOUT_SECONDS},
+        )
+        _configure_sqlite_engine(_background_engine.sync_engine, enable_wal=not is_sqlite_memory)
+    else:
+        _background_engine = create_async_engine(
+            db_url,
+            echo=False,
+            **_postgres_async_engine_kwargs(db_url, background=True),
+        )
+
+    _background_session_factory = async_sessionmaker(_background_engine, expire_on_commit=False, class_=AsyncSession)
+
+
 @asynccontextmanager
 async def get_background_session() -> AsyncIterator[AsyncSession]:
-    """Session provider for background tasks, schedulers, and auth dependencies."""
-    session = SessionLocal()
+    """Session provider for background tasks, schedulers, and auth dependencies.
+
+    Uses the separate background pool if initialized, otherwise falls back to main pool.
+    """
+    factory = _background_session_factory or SessionLocal
+    session = factory()
     try:
         yield session
     except BaseException:
@@ -173,31 +244,35 @@ async def init_db() -> None:
     _ensure_sqlite_dir(_settings.database_url)
     sqlite_path = sqlite_db_path_from_url(_settings.database_url)
     if sqlite_path is not None:
-        integrity = check_sqlite_integrity(sqlite_path)
-        if not integrity.ok:
-            details = integrity.details or "unknown error"
-            logger.error("SQLite integrity check failed path=%s details=%s", sqlite_path, details)
-            if "locked" in details.lower():
-                message = (
-                    f"SQLite integrity check failed for {sqlite_path} ({details}). "
-                    "Another instance may be running. Stop it and retry."
+        check_mode = _startup_sqlite_check_mode(_settings.database_sqlite_startup_check_mode)
+        if check_mode is not None:
+            integrity = check_sqlite_integrity(sqlite_path, mode=check_mode)
+            if not integrity.ok:
+                details = integrity.details or "unknown error"
+                pragma_name = "quick_check" if check_mode == SqliteIntegrityCheckMode.QUICK else "integrity_check"
+                logger.error(
+                    "SQLite %s failed path=%s details=%s",
+                    pragma_name,
+                    sqlite_path,
+                    details,
                 )
-            else:
-                message = (
-                    f"SQLite integrity check failed for {sqlite_path} ({details}). "
-                    "The database appears corrupted or the filesystem is unhealthy. "
-                    "Stop the app and run "
-                    f'`python -m app.db.recover --db "{sqlite_path}" --replace` '
-                    "or restore a backup from the same directory."
-                )
-            raise RuntimeError(message)
-
-    if not _settings.database_migrate_on_startup:
-        logger.info("Startup database migration is disabled")
-        return
+                if "locked" in details.lower():
+                    message = (
+                        f"SQLite {pragma_name} failed for {sqlite_path} ({details}). "
+                        "Another instance may be running. Stop it and retry."
+                    )
+                else:
+                    message = (
+                        f"SQLite {pragma_name} failed for {sqlite_path} ({details}). "
+                        "The database appears corrupted or the filesystem is unhealthy. "
+                        "Stop the app and run "
+                        f'`python -m app.db.recover --db "{sqlite_path}" --replace` '
+                        "or restore a backup from the same directory."
+                    )
+                raise RuntimeError(message)
 
     try:
-        inspect_migration_state, run_startup_migrations = _load_migration_entrypoints()
+        inspect_migration_state, run_startup_migrations, check_schema_drift = _load_migration_entrypoints()
     except ModuleNotFoundError as exc:
         if exc.name != "app.db.migrate":
             raise
@@ -206,6 +281,23 @@ async def init_db() -> None:
     except ImportError as exc:
         logger.exception("Failed to import database migration entrypoints from app.db.migrate")
         raise RuntimeError("Database migration entrypoint app.db.migrate is invalid") from exc
+
+    if not _settings.database_migrate_on_startup:
+        migration_state = await to_thread.run_sync(
+            lambda: inspect_migration_state(_settings.database_url),
+        )
+        if migration_state.needs_upgrade:
+            current_revision = migration_state.current_revision or "none"
+            message = (
+                "Startup database migration is disabled but database schema is behind Alembic head "
+                f"(current={current_revision}, head={migration_state.head_revision}). "
+                "Run the dedicated migration job or `python -m app.db.migrate upgrade` before starting the app."
+            )
+            logger.error(message)
+            raise RuntimeError(message)
+
+        logger.info("Startup database migration is disabled and database schema is current")
+        return
 
     if sqlite_path is not None and _settings.database_sqlite_pre_migrate_backup_enabled and sqlite_path.exists():
         migration_state = await to_thread.run_sync(
@@ -242,6 +334,10 @@ async def init_db() -> None:
             )
         if result.current_revision is not None:
             logger.info("Database migration complete revision=%s", result.current_revision)
+        drift = await to_thread.run_sync(lambda: check_schema_drift(_settings.database_url))
+        if drift:
+            drift_details = "; ".join(drift)
+            raise RuntimeError(f"Schema drift detected after startup migrations: {drift_details}")
     except Exception:
         logger.exception("Failed to apply database migrations")
         if _settings.database_migrations_fail_fast:
@@ -250,3 +346,5 @@ async def init_db() -> None:
 
 async def close_db() -> None:
     await engine.dispose()
+    if _background_engine is not None:
+        await _background_engine.dispose()

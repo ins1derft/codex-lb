@@ -165,7 +165,10 @@ class LimitRuleInput:
 class ApiKeyCreateData:
     name: str
     allowed_models: list[str] | None
-    expires_at: datetime | None
+    enforced_model: str | None = None
+    enforced_reasoning_effort: str | None = None
+    enforced_service_tier: str | None = None
+    expires_at: datetime | None = None
     limits: list[LimitRuleInput] = field(default_factory=list)
     owner_user_id: str = "dashboard-user-admin-default"
 
@@ -176,10 +179,18 @@ class ApiKeyUpdateData:
     name_set: bool = False
     allowed_models: list[str] | None = None
     allowed_models_set: bool = False
+    enforced_model: str | None = None
+    enforced_model_set: bool = False
+    enforced_reasoning_effort: str | None = None
+    enforced_reasoning_effort_set: bool = False
+    enforced_service_tier: str | None = None
+    enforced_service_tier_set: bool = False
     expires_at: datetime | None = None
     expires_at_set: bool = False
     is_active: bool | None = None
     is_active_set: bool = False
+    assigned_account_ids: list[str] | None = None
+    assigned_account_ids_set: bool = False
     limits: list[LimitRuleInput] | None = None
     limits_set: bool = False
     reset_usage: bool = False
@@ -191,12 +202,18 @@ class ApiKeyData:
     name: str
     key_prefix: str
     allowed_models: list[str] | None
+    enforced_model: str | None
+    enforced_reasoning_effort: str | None
+    enforced_service_tier: str | None
     expires_at: datetime | None
     is_active: bool
     created_at: datetime
     last_used_at: datetime | None
     owner_user_id: str | None = None
+    account_assignment_scope_enabled: bool = False
+    assigned_account_ids: list[str] = field(default_factory=list)
     limits: list[LimitRuleData] = field(default_factory=list)
+    usage_summary: "ApiKeyUsageSummaryData | None" = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,10 +222,38 @@ class ApiKeyCreatedData(ApiKeyData):
 
 
 @dataclass(frozen=True, slots=True)
+class ApiKeyUsageSummaryData:
+    request_count: int
+    total_tokens: int
+    cached_input_tokens: int
+    total_cost_usd: float
+
+
+@dataclass(frozen=True, slots=True)
 class ApiKeyUsageReservationData:
     reservation_id: str
     key_id: str
     model: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeySelfLimitData:
+    limit_type: str
+    limit_window: str
+    max_value: int
+    current_value: int
+    model_filter: str | None
+    reset_at: datetime
+    source: str = "api_key"
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeySelfUsageData:
+    request_count: int
+    total_tokens: int
+    cached_input_tokens: int
+    total_cost_usd: float
+    limits: list[ApiKeySelfLimitData] = field(default_factory=list)
 
 
 class ApiKeysService:
@@ -225,6 +270,9 @@ class ApiKeysService:
             key_hash=_hash_key(plain_key),
             key_prefix=plain_key[:15],
             allowed_models=_serialize_allowed_models(payload.allowed_models),
+            enforced_model=payload.enforced_model,
+            enforced_reasoning_effort=payload.enforced_reasoning_effort,
+            enforced_service_tier=payload.enforced_service_tier,
             expires_at=payload.expires_at,
             is_active=True,
             created_at=now,
@@ -324,12 +372,20 @@ class ApiKeysService:
             raise ApiKeyInvalidError("API key has expired")
         return _to_api_key_data(refreshed)
 
+    async def get_key_by_id(self, key_id: str) -> ApiKeyData:
+        row = await self._repository.get_by_id(key_id)
+        if row is None:
+            raise ApiKeyNotFoundError(f"API key not found: {key_id}")
+        return _to_api_key_data(row)
+
     async def enforce_limits_for_request(
         self,
         key_id: str,
         *,
         request_model: str | None,
+        request_service_tier: str | None = None,
     ) -> ApiKeyUsageReservationData:
+        del request_service_tier
         now = utcnow()
         row = _ensure_valid_api_key_row(await self._repository.get_by_id(key_id))
         if row.expires_at is not None and row.expires_at < now:
@@ -381,6 +437,29 @@ class ApiKeysService:
             reservation_id=reservation_id,
             key_id=key_id,
             model=request_model or "",
+        )
+
+    async def get_key_usage_summary_for_self(self, key_id: str) -> ApiKeySelfUsageData | None:
+        row = await self._repository.get_by_id(key_id)
+        if row is None:
+            return None
+        limits = [
+            ApiKeySelfLimitData(
+                limit_type=limit.limit_type.value,
+                limit_window=limit.limit_window.value,
+                max_value=limit.max_value,
+                current_value=min(limit.current_value, limit.max_value),
+                model_filter=limit.model_filter,
+                reset_at=limit.reset_at,
+            )
+            for limit in row.limits
+        ]
+        return ApiKeySelfUsageData(
+            request_count=0,
+            total_tokens=0,
+            cached_input_tokens=0,
+            total_cost_usd=0.0,
+            limits=limits,
         )
 
     async def finalize_usage_reservation(
@@ -643,11 +722,17 @@ def _to_created_data(data: ApiKeyData, key: str) -> ApiKeyCreatedData:
         name=data.name,
         key_prefix=data.key_prefix,
         allowed_models=data.allowed_models,
+        enforced_model=data.enforced_model,
+        enforced_reasoning_effort=data.enforced_reasoning_effort,
+        enforced_service_tier=data.enforced_service_tier,
         expires_at=data.expires_at,
         is_active=data.is_active,
+        account_assignment_scope_enabled=data.account_assignment_scope_enabled,
+        assigned_account_ids=data.assigned_account_ids,
         created_at=data.created_at,
         last_used_at=data.last_used_at,
         limits=data.limits,
+        usage_summary=data.usage_summary,
         key=key,
     )
 
@@ -660,8 +745,15 @@ def _to_api_key_data(row: ApiKey) -> ApiKeyData:
         name=row.name,
         key_prefix=row.key_prefix,
         allowed_models=_deserialize_allowed_models(row.allowed_models),
+        enforced_model=row.enforced_model,
+        enforced_reasoning_effort=row.enforced_reasoning_effort,
+        enforced_service_tier=row.enforced_service_tier,
         expires_at=row.expires_at,
         is_active=row.is_active,
+        account_assignment_scope_enabled=row.account_assignment_scope_enabled,
+        assigned_account_ids=[assignment.account_id for assignment in row.account_assignments]
+        if row.account_assignments
+        else [],
         created_at=row.created_at,
         last_used_at=row.last_used_at,
         limits=limits,

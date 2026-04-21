@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { completeOauth, getOauthStatus, startOauth } from "@/features/accounts/api";
+import {
+  completeOauth,
+  getOauthStatus,
+  startOauth,
+  submitManualOauthCallback,
+} from "@/features/accounts/api";
 import { OAuthStateSchema, type OAuthState } from "@/features/accounts/schemas";
 
 const INITIAL_OAUTH_STATE: OAuthState = OAuthStateSchema.parse({
@@ -87,6 +92,18 @@ export function useOauth() {
         errorMessage: null,
       });
       setState(nextState);
+
+      if (
+        nextState.method === "device"
+        && nextState.deviceAuthId
+        && nextState.userCode
+      ) {
+        await completeOauth({
+          deviceAuthId: nextState.deviceAuthId,
+          userCode: nextState.userCode,
+        });
+      }
+
       return nextState;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to start OAuth";
@@ -124,6 +141,29 @@ export function useOauth() {
       throw error;
     }
   }, [state.deviceAuthId, state.userCode]);
+
+  const manualCallback = useCallback(async (callbackUrl: string) => {
+    try {
+      const response = await submitManualOauthCallback({ callbackUrl });
+      setState((prev) =>
+        OAuthStateSchema.parse({
+          ...prev,
+          status: response.status === "success" ? "success" : "error",
+          errorMessage: response.errorMessage,
+        }),
+      );
+      return response;
+    } catch (error) {
+      setState((prev) =>
+        OAuthStateSchema.parse({
+          ...prev,
+          status: "error",
+          errorMessage: error instanceof Error ? error.message : "Failed to process OAuth callback",
+        }),
+      );
+      throw error;
+    }
+  }, []);
 
   useEffect(() => {
     if (state.status !== "pending" || !state.intervalSeconds || state.intervalSeconds <= 0) {
@@ -166,6 +206,7 @@ export function useOauth() {
     start,
     poll,
     complete,
+    manualCallback,
     reset,
   };
 }

@@ -23,6 +23,13 @@ class AccountUsage(DashboardModel):
     secondary_remaining_percent: float | None = None
 
 
+class AccountRequestUsage(DashboardModel):
+    request_count: int = 0
+    total_tokens: int = 0
+    cached_input_tokens: int = 0
+    total_cost_usd: float = 0.0
+
+
 class AccountTokenStatus(DashboardModel):
     expires_at: datetime | None = None
     state: str | None = None
@@ -32,6 +39,21 @@ class AccountAuthStatus(DashboardModel):
     access: AccountTokenStatus | None = None
     refresh: AccountTokenStatus | None = None
     id_token: AccountTokenStatus | None = None
+
+
+class AccountAdditionalWindow(DashboardModel):
+    used_percent: float
+    reset_at: int | None = None
+    window_minutes: int | None = None
+
+
+class AccountAdditionalQuota(DashboardModel):
+    quota_key: str | None = None
+    limit_name: str
+    metered_feature: str
+    display_label: str | None = None
+    primary_window: AccountAdditionalWindow | None = None
+    secondary_window: AccountAdditionalWindow | None = None
 
 
 class AccountSummary(DashboardModel):
@@ -51,6 +73,8 @@ class AccountSummary(DashboardModel):
     remaining_credits_primary: float | None = None
     capacity_credits_secondary: float | None = None
     remaining_credits_secondary: float | None = None
+    request_usage: AccountRequestUsage | None = None
+    additional_quotas: list[AccountAdditionalQuota] = Field(default_factory=list)
     deactivation_reason: str | None = None
     auth: AccountAuthStatus | None = None
 

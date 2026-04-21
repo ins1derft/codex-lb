@@ -1,5 +1,6 @@
 import { Clock, ExternalLink, Play, RotateCcw } from "lucide-react";
 
+import { usePrivacyStore } from "@/hooks/use-privacy";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/status-badge";
 import { cn } from "@/lib/utils";
@@ -10,7 +11,7 @@ import {
   quotaBarColor,
   quotaBarTrack,
 } from "@/utils/account-status";
-import { formatPercentNullable, formatQuotaResetLabel } from "@/utils/formatters";
+import { formatPercentNullable, formatQuotaResetLabel, formatSlug } from "@/utils/formatters";
 
 type AccountAction = "details" | "resume" | "reauth";
 
@@ -65,6 +66,7 @@ function QuotaBar({
 }
 
 export function AccountCard({ account, showAccountId = false, onAction }: AccountCardProps) {
+  const blurred = usePrivacyStore((s) => s.blurred);
   const status = normalizeStatus(account.status);
   const primaryRemaining = account.usage?.primaryRemainingPercent ?? null;
   const secondaryRemaining = account.usage?.secondaryRemainingPercent ?? null;
@@ -75,22 +77,30 @@ export function AccountCard({ account, showAccountId = false, onAction }: Accoun
 
   const title = account.displayName || account.email;
   const compactId = formatCompactAccountId(account.accountId);
+  const planLabel = formatSlug(account.planType);
   const emailSubtitle =
     account.displayName && account.displayName !== account.email
       ? account.email
       : null;
-  const heading = showAccountId && !emailSubtitle ? `${title} (${compactId})` : title;
-  const subtitle = showAccountId && emailSubtitle ? `${emailSubtitle} | ID ${compactId}` : emailSubtitle;
+  const idSuffix = showAccountId ? ` | ID ${compactId}` : "";
 
   return (
     <div className="card-hover rounded-xl border bg-card p-4">
       {/* Header */}
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="truncate text-sm font-semibold leading-tight">{heading}</p>
-          {subtitle ? (
+          <p className="truncate text-sm font-semibold leading-tight">
+            {blurred
+              ? <span className="privacy-blur">{title}</span>
+              : title}
+          </p>
+          <p className="mt-0.5 truncate text-xs text-muted-foreground">
+            {planLabel}
+            {!emailSubtitle ? idSuffix : ""}
+          </p>
+          {emailSubtitle ? (
             <p className="mt-0.5 truncate text-xs text-muted-foreground" title={showAccountId ? `Account ID ${account.accountId}` : undefined}>
-              {subtitle}
+              <span className={blurred ? "privacy-blur" : undefined}>{emailSubtitle}</span>{showAccountId ? ` | ID ${compactId}` : ""}
             </p>
           ) : null}
         </div>
@@ -99,8 +109,8 @@ export function AccountCard({ account, showAccountId = false, onAction }: Accoun
 
       {/* Quota bars */}
       <div className={cn("mt-3.5 grid gap-3", weeklyOnly ? "grid-cols-1" : "grid-cols-2")}>
-        {!weeklyOnly && <QuotaBar label="Primary" percent={primaryRemaining} resetLabel={primaryReset} />}
-        <QuotaBar label="Secondary" percent={secondaryRemaining} resetLabel={secondaryReset} />
+        {!weeklyOnly && <QuotaBar label="5h" percent={primaryRemaining} resetLabel={primaryReset} />}
+        <QuotaBar label="Weekly" percent={secondaryRemaining} resetLabel={secondaryReset} />
       </div>
 
       {/* Actions */}

@@ -1,7 +1,7 @@
 import { z } from "zod";
 
-export const LIMIT_TYPES = ["total_tokens", "input_tokens", "output_tokens", "cost_usd"] as const;
-export const LIMIT_WINDOWS = ["daily", "weekly", "monthly"] as const;
+export const LIMIT_TYPES = ["total_tokens", "input_tokens", "output_tokens", "cost_usd", "credits"] as const;
+export const LIMIT_WINDOWS = ["daily", "weekly", "monthly", "5h", "7d"] as const;
 
 export type LimitType = (typeof LIMIT_TYPES)[number];
 export type LimitWindowType = (typeof LIMIT_WINDOWS)[number];
@@ -23,23 +23,54 @@ export const LimitRuleCreateSchema = z.object({
   modelFilter: z.string().nullable().optional(),
 });
 
+export const ApiKeyUsageSummarySchema = z.object({
+  requestCount: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative(),
+  totalCostUsd: z.number().nonnegative().default(0),
+});
+
+export const SERVICE_TIERS = ["auto", "default", "priority", "flex"] as const;
+export type ServiceTierType = (typeof SERVICE_TIERS)[number];
+
 export const ApiKeySchema = z.object({
   id: z.string(),
   ownerUserId: z.string().nullable().optional(),
   name: z.string(),
   keyPrefix: z.string(),
   allowedModels: z.array(z.string()).nullable(),
+  enforcedModel: z.string().nullable().default(null),
+  enforcedReasoningEffort: z
+    .enum(["none", "minimal", "low", "medium", "high", "xhigh"])
+    .nullable()
+    .default(null),
+  enforcedServiceTier: z
+    .enum(SERVICE_TIERS)
+    .nullable()
+    .default(null),
   expiresAt: z.string().datetime({ offset: true }).nullable(),
   isActive: z.boolean(),
+  accountAssignmentScopeEnabled: z.boolean().default(false),
+  assignedAccountIds: z.array(z.string()).default([]),
   createdAt: z.string().datetime({ offset: true }),
   lastUsedAt: z.string().datetime({ offset: true }).nullable(),
   limits: z.array(LimitRuleSchema).default([]),
+  usageSummary: ApiKeyUsageSummarySchema.nullable().default(null),
 });
 
 export const ApiKeyCreateRequestSchema = z.object({
   ownerUserId: z.string().optional(),
   name: z.string().min(1).max(128),
   allowedModels: z.array(z.string()).optional(),
+  enforcedModel: z.string().min(1).nullable().optional(),
+  enforcedReasoningEffort: z
+    .enum(["none", "minimal", "low", "medium", "high", "xhigh"])
+    .nullable()
+    .optional(),
+  enforcedServiceTier: z
+    .enum(SERVICE_TIERS)
+    .nullable()
+    .optional(),
   weeklyTokenLimit: z.number().int().positive().nullable().optional(),
   expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
   limits: z.array(LimitRuleCreateSchema).optional(),
@@ -52,9 +83,19 @@ export const ApiKeyCreateResponseSchema = ApiKeySchema.extend({
 export const ApiKeyUpdateRequestSchema = z.object({
   name: z.string().min(1).max(128).optional(),
   allowedModels: z.array(z.string()).nullable().optional(),
+  enforcedModel: z.string().min(1).nullable().optional(),
+  enforcedReasoningEffort: z
+    .enum(["none", "minimal", "low", "medium", "high", "xhigh"])
+    .nullable()
+    .optional(),
+  enforcedServiceTier: z
+    .enum(SERVICE_TIERS)
+    .nullable()
+    .optional(),
   weeklyTokenLimit: z.number().int().positive().nullable().optional(),
   expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
   isActive: z.boolean().optional(),
+  assignedAccountIds: z.array(z.string()).optional(),
   limits: z.array(LimitRuleCreateSchema).optional(),
   resetUsage: z.boolean().optional(),
 });

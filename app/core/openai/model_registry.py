@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
+
+import anyio
 
 from app.core.types import JsonValue
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -30,7 +36,8 @@ class UpstreamModel:
     minimal_client_version: str | None
     priority: int
     available_in_plans: frozenset[str]
-    raw: dict[str, JsonValue] = field(hash=False, compare=False)
+    base_instructions: str = ""
+    raw: dict[str, JsonValue] = field(default_factory=dict, hash=False, compare=False)
 
 
 @dataclass
@@ -41,71 +48,105 @@ class ModelRegistrySnapshot:
     fetched_at: float
 
 
+_BOOTSTRAP_WEBSOCKET_PREFERRED_MODEL_PATTERNS = ("gpt-5.4", "gpt-5.4-*")
+
+
 class ModelRegistry:
     def __init__(self, *, ttl_seconds: float = 300.0) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
         self._ttl_seconds = ttl_seconds
         self._snapshot: ModelRegistrySnapshot | None = None
+        self._bootstrap_models: dict[str, UpstreamModel] = {}
+        self._lock = anyio.Lock()
 
     def get_snapshot(self) -> ModelRegistrySnapshot | None:
         return self._snapshot
+
+    def get_models_with_fallback(self) -> dict[str, UpstreamModel]:
+        snapshot = self._snapshot
+        if snapshot is not None:
+            return snapshot.models
+        return self._bootstrap_models
 
     def plan_types_for_model(self, slug: str) -> frozenset[str] | None:
         if self._snapshot is None:
             return None
         return self._snapshot.model_plans.get(slug, frozenset())
 
+    def prefers_websockets(self, slug: str | None) -> bool:
+        if not isinstance(slug, str):
+            return False
+        normalized_slug = slug.strip().lower()
+        if not normalized_slug:
+            return False
+
+        if self._snapshot is not None:
+            model = self._snapshot.models.get(slug) or self._snapshot.models.get(normalized_slug)
+            if model is not None:
+                return model.prefer_websockets
+
+        return any(fnmatchcase(normalized_slug, pattern) for pattern in _BOOTSTRAP_WEBSOCKET_PREFERRED_MODEL_PATTERNS)
+
     def needs_refresh(self) -> bool:
         if self._snapshot is None:
             return True
         return (time.monotonic() - self._snapshot.fetched_at) >= self._ttl_seconds
 
-    def update(self, per_plan_results: dict[str, list[UpstreamModel]]) -> None:
+    async def update(self, per_plan_results: dict[str, list[UpstreamModel]]) -> None:
         if not per_plan_results:
+            logger.warning("Model registry refresh produced no plan results; keeping cached snapshot")
             return
 
-        previous = self._snapshot
-        models: dict[str, UpstreamModel] = {}
-        model_plans: dict[str, set[str]] = {}
+        async with self._lock:
+            previous = self._snapshot
+            try:
+                models: dict[str, UpstreamModel] = {}
+                model_plans: dict[str, set[str]] = {}
 
-        # Carry over data from plans not present in per_plan_results
-        if previous is not None:
-            previous_plans = set(previous.plan_models.keys())
-            refreshed_plans = set(per_plan_results.keys())
-            stale_plans = previous_plans - refreshed_plans
+                # Carry over data from plans not present in per_plan_results
+                if previous is not None:
+                    previous_plans = set(previous.plan_models.keys())
+                    refreshed_plans = set(per_plan_results.keys())
+                    stale_plans = previous_plans - refreshed_plans
 
-            for plan_type in stale_plans:
-                stale_slugs = previous.plan_models.get(plan_type, frozenset())
-                for slug in stale_slugs:
-                    if slug not in models and slug in previous.models:
-                        models[slug] = previous.models[slug]
-                    model_plans.setdefault(slug, set()).add(plan_type)
+                    for plan_type in stale_plans:
+                        stale_slugs = previous.plan_models.get(plan_type, frozenset())
+                        for slug in stale_slugs:
+                            if slug not in models and slug in previous.models:
+                                models[slug] = previous.models[slug]
+                            model_plans.setdefault(slug, set()).add(plan_type)
 
-        # Merge newly fetched results
-        for plan_type, plan_models_list in per_plan_results.items():
-            for model in plan_models_list:
-                models[model.slug] = model
-                model_plans.setdefault(model.slug, set()).add(plan_type)
+                # Merge newly fetched results
+                for plan_type, plan_models_list in per_plan_results.items():
+                    for model in plan_models_list:
+                        models[model.slug] = model
+                        model_plans.setdefault(model.slug, set()).add(plan_type)
 
-        frozen_model_plans: dict[str, frozenset[str]] = {slug: frozenset(plans) for slug, plans in model_plans.items()}
+                frozen_model_plans: dict[str, frozenset[str]] = {
+                    slug: frozenset(plans) for slug, plans in model_plans.items()
+                }
 
-        # Build reverse index: plan_type -> set of slugs
-        plan_models_index: dict[str, set[str]] = {}
-        for slug, plans in frozen_model_plans.items():
-            for plan_type in plans:
-                plan_models_index.setdefault(plan_type, set()).add(slug)
+                # Build reverse index: plan_type -> set of slugs
+                plan_models_index: dict[str, set[str]] = {}
+                for slug, plans in frozen_model_plans.items():
+                    for plan_type in plans:
+                        plan_models_index.setdefault(plan_type, set()).add(slug)
 
-        frozen_plan_models: dict[str, frozenset[str]] = {
-            plan_type: frozenset(slugs) for plan_type, slugs in plan_models_index.items()
-        }
+                frozen_plan_models: dict[str, frozenset[str]] = {
+                    plan_type: frozenset(slugs) for plan_type, slugs in plan_models_index.items()
+                }
 
-        self._snapshot = ModelRegistrySnapshot(
-            models=models,
-            model_plans=frozen_model_plans,
-            plan_models=frozen_plan_models,
-            fetched_at=time.monotonic(),
-        )
+                self._snapshot = ModelRegistrySnapshot(
+                    models=models,
+                    model_plans=frozen_model_plans,
+                    plan_models=frozen_plan_models,
+                    fetched_at=time.monotonic(),
+                )
+            except Exception:
+                self._snapshot = previous
+                logger.warning("Model registry refresh failed; keeping cached snapshot", exc_info=True)
+                raise
 
 
 _model_registry = ModelRegistry()

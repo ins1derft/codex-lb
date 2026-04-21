@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.core.openai.contracts import OpenAIMessage
 from app.core.openai.message_coercion import coerce_messages
 from app.core.openai.requests import (
     ResponsesRequest,
@@ -18,11 +20,31 @@ from app.core.utils.json_guards import is_json_list, is_json_mapping
 _SUPPORTED_CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
 
 
+def _content_parts(content: JsonValue) -> list[JsonValue]:
+    if is_json_list(content):
+        return content
+    return [content]
+
+
+def _part_type(part: Mapping[str, JsonValue]) -> str | None:
+    explicit_type = part.get("type")
+    if isinstance(explicit_type, str) and explicit_type:
+        return explicit_type
+    text_value = part.get("text")
+    return "text" if isinstance(text_value, str) else None
+
+
+def _json_mapping(value: JsonValue | OpenAIMessage) -> Mapping[str, JsonValue] | None:
+    if not is_json_mapping(value):
+        return None
+    return value
+
+
 class ChatCompletionsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = Field(min_length=1)
-    messages: list[dict[str, JsonValue]]
+    messages: list[OpenAIMessage]
     tools: list[JsonValue] = Field(default_factory=list)
     tool_choice: str | dict[str, JsonValue] | None = None
     parallel_tool_calls: bool | None = None
@@ -36,6 +58,7 @@ class ChatCompletionsRequest(BaseModel):
     logprobs: bool | None = None
     top_logprobs: int | None = None
     seed: int | None = None
+    service_tier: str | None = None
     response_format: JsonValue | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
@@ -49,22 +72,24 @@ class ChatCompletionsRequest(BaseModel):
 
     @field_validator("messages")
     @classmethod
-    def _reject_file_id(cls, value: list[dict[str, JsonValue]]) -> list[dict[str, JsonValue]]:
+    def _reject_file_id(cls, value: list[OpenAIMessage]) -> list[OpenAIMessage]:
         for message in value:
-            if not is_json_mapping(message):
+            message_mapping = _json_mapping(message)
+            if message_mapping is None:
                 continue
-            content = message.get("content")
-            parts = content if is_json_list(content) else [content]
-            for part in parts:
-                if not is_json_mapping(part):
+            content = message_mapping.get("content")
+            for part in _content_parts(content):
+                part_mapping = _json_mapping(part)
+                if part_mapping is None:
                     continue
-                part_type = part.get("type") or ("text" if "text" in part else None)
-                if part_type != "file" and "file" not in part:
+                part_type = _part_type(part_mapping)
+                file_info = part_mapping.get("file")
+                if part_type != "file" and _json_mapping(file_info) is None:
                     continue
-                file_info = part.get("file")
-                if not is_json_mapping(file_info):
+                file_info_mapping = _json_mapping(file_info)
+                if file_info_mapping is None:
                     continue
-                file_id = file_info.get("file_id")
+                file_id = file_info_mapping.get("file_id")
                 if isinstance(file_id, str) and file_id:
                     raise ValueError("file_id is not supported")
         return value
@@ -114,7 +139,7 @@ class ChatCompletionsRequest(BaseModel):
             include_obfuscation = stream_options.get("include_obfuscation")
             if include_obfuscation is not None:
                 data["stream_options"] = {"include_obfuscation": include_obfuscation}
-        instructions, input_items = coerce_messages("", messages)
+        instructions, input_items = coerce_messages("", cast(list[JsonValue], messages))
         data["instructions"] = instructions
         data["input"] = input_items
         data["tools"] = tools
@@ -241,11 +266,13 @@ def _text_format_from_parsed(parsed: ChatResponseFormat) -> ResponsesTextFormat:
         json_schema = parsed.json_schema
         if json_schema is None:
             raise ValueError("'response_format.json_schema' is required when type is 'json_schema'.")
-        return ResponsesTextFormat(
-            type=parsed.type,
-            schema_=json_schema.schema_,
-            name=json_schema.name,
-            strict=json_schema.strict,
+        return ResponsesTextFormat.model_validate(
+            {
+                "type": parsed.type,
+                "schema": json_schema.schema_,
+                "name": json_schema.name,
+                "strict": json_schema.strict,
+            }
         )
     if parsed.type in ("json_object", "text"):
         return ResponsesTextFormat(type=parsed.type)
@@ -258,23 +285,25 @@ def _ensure_text_only_content(content: JsonValue, role: str) -> None:
     if isinstance(content, str):
         return
     if is_json_list(content):
-        for part in content:
+        for part in _content_parts(content):
             if isinstance(part, str):
                 continue
-            if is_json_mapping(part):
-                part_type = part.get("type")
+            part_mapping = _json_mapping(part)
+            if part_mapping is not None:
+                part_type = part_mapping.get("type")
                 if part_type not in (None, "text"):
                     raise ValueError(f"{role} messages must be text-only.")
-                text = part.get("text")
+                text = part_mapping.get("text")
                 if isinstance(text, str):
                     continue
             raise ValueError(f"{role} messages must be text-only.")
         return
-    if is_json_mapping(content):
-        part_type = content.get("type")
+    content_mapping = _json_mapping(content)
+    if content_mapping is not None:
+        part_type = content_mapping.get("type")
         if part_type not in (None, "text"):
             raise ValueError(f"{role} messages must be text-only.")
-        text = content.get("text")
+        text = content_mapping.get("text")
         if isinstance(text, str):
             return
     raise ValueError(f"{role} messages must be text-only.")
@@ -283,21 +312,21 @@ def _ensure_text_only_content(content: JsonValue, role: str) -> None:
 def _validate_user_content(content: JsonValue) -> None:
     if content is None or isinstance(content, str):
         return
-    parts = content if is_json_list(content) else [content]
-    for part in parts:
+    for part in _content_parts(content):
         if isinstance(part, str):
             continue
-        if not is_json_mapping(part):
+        part_mapping = _json_mapping(part)
+        if part_mapping is None:
             raise ValueError("User message content parts must be objects.")
-        part_type = part.get("type") or ("text" if "text" in part else None)
+        part_type = _part_type(part_mapping)
         if part_type == "text":
-            text = part.get("text")
+            text = part_mapping.get("text")
             if not isinstance(text, str):
                 raise ValueError("Text content parts must include a string 'text'.")
             continue
         if part_type == "image_url":
-            image_url = part.get("image_url")
-            if not is_json_mapping(image_url):
+            image_url = _json_mapping(part_mapping.get("image_url"))
+            if image_url is None:
                 raise ValueError("Image content parts must include image_url.url.")
             if not isinstance(image_url.get("url"), str):
                 raise ValueError("Image content parts must include image_url.url.")
@@ -305,8 +334,8 @@ def _validate_user_content(content: JsonValue) -> None:
         if part_type == "input_audio":
             raise ValueError("Audio input is not supported.")
         if part_type == "file":
-            file_info = part.get("file")
-            if not is_json_mapping(file_info):
+            file_info = _json_mapping(part_mapping.get("file"))
+            if file_info is None:
                 raise ValueError("File content parts must include file metadata.")
             continue
         raise ValueError(f"Unsupported user content part type: {part_type}")
@@ -331,22 +360,23 @@ def _validate_assistant_tool_calls(message: Mapping[str, JsonValue]) -> None:
         return
     if not is_json_list(tool_calls):
         raise ValueError("assistant message 'tool_calls' must be an array.")
-    for index, tool_call in enumerate(tool_calls):
-        if not is_json_mapping(tool_call):
+    for index, tool_call in enumerate(_content_parts(tool_calls)):
+        tool_call_mapping = _json_mapping(tool_call)
+        if tool_call_mapping is None:
             raise ValueError(f"assistant tool_calls[{index}] must be an object.")
-        call_id = tool_call.get("id")
+        call_id = tool_call_mapping.get("id")
         if not isinstance(call_id, str) or not call_id:
             raise ValueError(f"assistant tool_calls[{index}] must include a non-empty 'id'.")
-        function = tool_call.get("function")
-        if not is_json_mapping(function):
+        function = _json_mapping(tool_call_mapping.get("function"))
+        if function is None:
             raise ValueError(f"assistant tool_calls[{index}] must include a 'function' object.")
         name = function.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError(f"assistant tool_calls[{index}].function must include a non-empty 'name'.")
 
 
-def _sanitize_user_messages(messages: list[dict[str, JsonValue]]) -> list[dict[str, JsonValue]]:
-    sanitized: list[dict[str, JsonValue]] = []
+def _sanitize_user_messages(messages: list[OpenAIMessage]) -> list[OpenAIMessage]:
+    sanitized: list[OpenAIMessage] = []
     for message in messages:
         role = message.get("role")
         if role != "user":
@@ -357,26 +387,23 @@ def _sanitize_user_messages(messages: list[dict[str, JsonValue]]) -> list[dict[s
         new_message = dict(message)
         if sanitized_content is not None:
             new_message["content"] = sanitized_content
-        sanitized.append(new_message)
+        sanitized.append(cast(OpenAIMessage, new_message))
     return sanitized
 
 
 def _drop_oversized_images(content: JsonValue) -> JsonValue | None:
     if content is None or isinstance(content, str):
         return content
-    parts = content if is_json_list(content) else [content]
     sanitized_parts: list[JsonValue] = []
-    for part in parts:
-        if not is_json_mapping(part):
+    for part in _content_parts(content):
+        part_mapping = _json_mapping(part)
+        if part_mapping is None:
             sanitized_parts.append(part)
             continue
-        part_type = part.get("type") or ("text" if "text" in part else None)
+        part_type = _part_type(part_mapping)
         if part_type == "image_url":
-            image_url = part.get("image_url")
-            if is_json_mapping(image_url):
-                url = image_url.get("url")
-            else:
-                url = None
+            image_url = _json_mapping(part_mapping.get("image_url"))
+            url = image_url.get("url") if image_url is not None else None
             if isinstance(url, str) and _is_oversized_data_url(url):
                 continue
         sanitized_parts.append(part)

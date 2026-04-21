@@ -10,7 +10,9 @@ import {
 } from "recharts";
 
 import { useChartColors } from "@/hooks/use-chart-colors";
+import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import type { UsageTrendPoint } from "@/features/accounts/schemas";
+import { formatChartDateTime } from "@/utils/formatters";
 
 type MergedPoint = {
   t: string;
@@ -23,9 +25,17 @@ function mergePoints(
   secondary: UsageTrendPoint[],
 ): MergedPoint[] {
   const secondaryMap = new Map(secondary.map((p) => [p.t, p.v]));
-  return primary.map((p) => ({
+  const primaryMap = new Map(primary.map((p) => [p.t, p.v]));
+  
+  if (primary.length === 0 && secondary.length === 0) {
+    return [];
+  }
+  
+  const basePoints = primary.length > 0 ? primary : secondary;
+  
+  return basePoints.map((p) => ({
     t: p.t,
-    primary: p.v,
+    primary: primaryMap.get(p.t) ?? 0,
     secondary: secondaryMap.get(p.t) ?? 0,
   }));
 }
@@ -54,13 +64,7 @@ type ChartTooltipProps = {
 
 function CustomTooltip({ active, payload, label }: ChartTooltipProps) {
   if (!active || !payload?.length) return null;
-  const d = new Date(label as string);
-  const heading = d.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  const heading = formatChartDateTime(label as string);
   return (
     <div className="rounded-lg border bg-popover px-3 py-2 text-popover-foreground shadow-md">
       <p className="mb-1 text-[11px] text-muted-foreground">{heading}</p>
@@ -90,6 +94,7 @@ export type AccountTrendChartProps = {
 
 export function AccountTrendChart({ primary, secondary }: AccountTrendChartProps) {
   const chartColors = useChartColors();
+  const reducedMotion = useReducedMotion();
   const c1 = chartColors[0];
   const c2 = chartColors[1];
   const data = useMemo(() => mergePoints(primary, secondary), [primary, secondary]);
@@ -119,7 +124,7 @@ export function AccountTrendChart({ primary, secondary }: AccountTrendChartProps
         <XAxis
           dataKey="t"
           tickFormatter={formatXTick}
-          tick={{ fontSize: 10, fill: "hsl(var(--muted-foreground))" }}
+          tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
           tickLine={false}
           axisLine={false}
           minTickGap={50}
@@ -129,7 +134,7 @@ export function AccountTrendChart({ primary, secondary }: AccountTrendChartProps
           domain={[0, 100]}
           ticks={[0, 25, 50, 75, 100]}
           tickFormatter={(v: number) => `${v}%`}
-          tick={{ fontSize: 10, fill: "hsl(var(--muted-foreground))" }}
+          tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
           tickLine={false}
           axisLine={false}
           width={38}
@@ -138,29 +143,33 @@ export function AccountTrendChart({ primary, secondary }: AccountTrendChartProps
           content={<CustomTooltip />}
           cursor={{ stroke: "hsl(var(--border))", strokeWidth: 1 }}
         />
-        <Area
-          type="monotone"
-          dataKey="primary"
-          stroke={c1}
-          strokeWidth={1.5}
-          fill="url(#trend-primary)"
-          dot={false}
-          activeDot={{ r: 3, strokeWidth: 1.5, fill: "hsl(var(--popover))" }}
-          isAnimationActive
-          animationDuration={500}
-        />
-        <Area
-          type="monotone"
-          dataKey="secondary"
-          stroke={c2}
-          strokeWidth={1.5}
-          fill="url(#trend-secondary)"
-          dot={false}
-          activeDot={{ r: 3, strokeWidth: 1.5, fill: "hsl(var(--popover))" }}
-          isAnimationActive
-          animationDuration={500}
-          animationBegin={100}
-        />
+        {primary.length > 0 && (
+          <Area
+            type="monotone"
+            dataKey="primary"
+            stroke={c1}
+            strokeWidth={1.5}
+            fill="url(#trend-primary)"
+            dot={false}
+            activeDot={{ r: 3, strokeWidth: 1.5, fill: "hsl(var(--popover))" }}
+            isAnimationActive={!reducedMotion}
+            animationDuration={500}
+          />
+        )}
+        {secondary.length > 0 && (
+          <Area
+            type="monotone"
+            dataKey="secondary"
+            stroke={c2}
+            strokeWidth={1.5}
+            fill="url(#trend-secondary)"
+            dot={false}
+            activeDot={{ r: 3, strokeWidth: 1.5, fill: "hsl(var(--popover))" }}
+            isAnimationActive={!reducedMotion}
+            animationDuration={500}
+            animationBegin={100}
+          />
+        )}
       </AreaChart>
     </ResponsiveContainer>
   );

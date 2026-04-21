@@ -18,6 +18,7 @@ describe("AccountList", () => {
             displayName: "Primary",
             planType: "plus",
             status: "active",
+            additionalQuotas: [],
           },
           {
             accountId: "acc-2",
@@ -25,6 +26,7 @@ describe("AccountList", () => {
             displayName: "Secondary",
             planType: "pro",
             status: "paused",
+            additionalQuotas: [],
           },
         ]}
         selectedAccountId="acc-1"
@@ -57,6 +59,7 @@ describe("AccountList", () => {
             displayName: "Primary",
             planType: "plus",
             status: "active",
+            additionalQuotas: [],
           },
         ]}
         selectedAccountId={null}
@@ -80,6 +83,7 @@ describe("AccountList", () => {
             displayName: "Duplicate A",
             planType: "plus",
             status: "active",
+            additionalQuotas: [],
           },
           {
             accountId: "7f9de2ad-7621-4a6f-88bc-ec7f3d914701_91a95cee",
@@ -87,6 +91,7 @@ describe("AccountList", () => {
             displayName: "Duplicate B",
             planType: "plus",
             status: "active",
+            additionalQuotas: [],
           },
           {
             accountId: "acc-3",
@@ -94,6 +99,7 @@ describe("AccountList", () => {
             displayName: "Unique",
             planType: "pro",
             status: "active",
+            additionalQuotas: [],
           },
         ]}
         selectedAccountId={null}
@@ -103,9 +109,9 @@ describe("AccountList", () => {
       />,
     );
 
-    expect(screen.getByText(/dup@example\.com \| ID d48f0bfc\.\.\.12b5d5/)).toBeInTheDocument();
-    expect(screen.getByText(/dup@example\.com \| ID 7f9de2ad\.\.\.a95cee/)).toBeInTheDocument();
+    expect(screen.getByText((_content, el) => el?.tagName === "P" && !!el.textContent?.match(/dup@example\.com \| ID d48f0bfc\.\.\.12b5d5/))).toBeInTheDocument();
+    expect(screen.getByText((_content, el) => el?.tagName === "P" && !!el.textContent?.match(/dup@example\.com \| ID 7f9de2ad\.\.\.a95cee/))).toBeInTheDocument();
     expect(screen.getByText("unique@example.com")).toBeInTheDocument();
-    expect(screen.queryByText(/unique@example\.com \| ID/)).not.toBeInTheDocument();
+    expect(screen.queryByText((_content, el) => el?.tagName === "P" && !!el.textContent?.match(/unique@example\.com \| ID/))).not.toBeInTheDocument();
   });
 });

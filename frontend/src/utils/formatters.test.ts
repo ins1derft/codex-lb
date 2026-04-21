@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RESET_ERROR_LABEL } from "@/utils/constants";
+import { useTimeFormatStore } from "@/hooks/use-time-format";
 import {
+  formatChartDateTime,
+  formatDateTimeInline,
   formatAccessTokenLabel,
   formatCachedTokensMeta,
   formatCompactNumber,
@@ -16,6 +19,7 @@ import {
   formatQuotaResetLabel,
   formatQuotaResetMeta,
   formatRate,
+  formatResetRelative,
   formatRefreshTokenLabel,
   formatRelative,
   formatTimeLong,
@@ -31,6 +35,7 @@ describe("formatters", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    useTimeFormatStore.setState({ timeFormat: "12h" });
   });
 
   afterEach(() => {
@@ -86,6 +91,8 @@ describe("formatters", () => {
 
   it("formats model and datetime labels", () => {
     expect(formatModelLabel("gpt-4.1", "high")).toBe("gpt-4.1 (high)");
+    expect(formatModelLabel("gpt-4.1", "high", "priority")).toBe("gpt-4.1 (high, priority)");
+    expect(formatModelLabel("gpt-4.1", null, "priority")).toBe("gpt-4.1 (priority)");
     expect(formatModelLabel("gpt-4.1", null)).toBe("gpt-4.1");
     expect(formatModelLabel(null, null)).toBe("--");
 
@@ -94,17 +101,38 @@ describe("formatters", () => {
     expect(formatted.date).not.toBe("--");
   });
 
+  it("respects the configured 12h or 24h time format", () => {
+    const iso = "2026-01-01T00:00:00.000Z";
+
+    const twelveHour = formatTimeLong(iso).time;
+    expect(twelveHour).toMatch(/AM|PM/);
+
+    useTimeFormatStore.getState().setTimeFormat("24h");
+
+    const twentyFourHour = formatTimeLong(iso).time;
+    expect(twentyFourHour).not.toMatch(/AM|PM/);
+    expect(formatDateTimeInline(iso)).toContain(twentyFourHour);
+    expect(formatChartDateTime(iso)).not.toMatch(/AM|PM/);
+  });
+
   it("formats relative and countdown values", () => {
     expect(formatRelative(30 * 60_000)).toBe("in 30m");
     expect(formatRelative(90 * 60_000)).toBe("in 2h");
     expect(formatRelative(30 * 60 * 60_000)).toBe("in 2d");
+    expect(formatResetRelative(30 * 60_000)).toBe("in 30m");
+    expect(formatResetRelative((4 * 60 + 13) * 60_000)).toBe("in 4h 13m");
+    expect(formatResetRelative((6 * 24 + 13) * 60 * 60_000)).toBe("in 6d 13h");
     expect(formatCountdown(125)).toBe("2:05");
   });
 
   it("formats quota reset labels", () => {
     const in30m = new Date(Date.now() + 30 * 60_000).toISOString();
+    const in4h13m = new Date(Date.now() + (4 * 60 + 13) * 60_000).toISOString();
+    const in6d13h = new Date(Date.now() + (6 * 24 + 13) * 60 * 60_000).toISOString();
     const inPast = new Date(Date.now() - 1_000).toISOString();
     expect(formatQuotaResetLabel(in30m)).toBe("in 30m");
+    expect(formatQuotaResetLabel(in4h13m)).toBe("in 4h 13m");
+    expect(formatQuotaResetLabel(in6d13h)).toBe("in 6d 13h");
     expect(formatQuotaResetLabel(inPast)).toBe("now");
     expect(formatQuotaResetLabel("1970-01-01T00:00:00.000Z")).toBe(RESET_ERROR_LABEL);
     expect(formatQuotaResetLabel("bad-date")).toBe(RESET_ERROR_LABEL);

@@ -6,11 +6,14 @@ import {
   AccountsResponseSchema,
   CredentialsImportResponseSchema,
   AccountTrendsResponseSchema,
+  ManualOauthCallbackRequestSchema,
+  ManualOauthCallbackResponseSchema,
   OauthCompleteRequestSchema,
   OauthCompleteResponseSchema,
   OauthStartRequestSchema,
   OauthStartResponseSchema,
   OauthStatusResponseSchema,
+  RuntimeConnectAddressResponseSchema,
 } from "@/features/accounts/schemas";
 
 const ACCOUNTS_BASE_PATH = "/api/accounts";
@@ -85,4 +88,14 @@ export function completeOauth(payload?: unknown) {
   return post(`${OAUTH_BASE_PATH}/complete`, OauthCompleteResponseSchema, {
     body: validated,
   });
+}
+export function submitManualOauthCallback(payload: unknown) {
+  const validated = ManualOauthCallbackRequestSchema.parse(payload);
+  return post(`${OAUTH_BASE_PATH}/manual-callback`, ManualOauthCallbackResponseSchema, {
+    body: validated,
+  });
+}
+
+export function getRuntimeConnectAddress() {
+  return get("/api/settings/runtime/connect-address", RuntimeConnectAddressResponseSchema);
 }

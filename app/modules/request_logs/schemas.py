@@ -9,9 +9,15 @@ from app.modules.shared.schemas import DashboardModel
 
 class RequestLogEntry(DashboardModel):
     requested_at: datetime
-    account_id: str
+    account_id: str | None = None
+    plan_type: str | None = None
+    api_key_name: str | None = None
     request_id: str
     model: str
+    transport: str | None = None
+    service_tier: str | None = None
+    requested_service_tier: str | None = None
+    actual_service_tier: str | None = None
     status: str
     error_code: str | None = None
     error_message: str | None = None
@@ -20,6 +26,7 @@ class RequestLogEntry(DashboardModel):
     reasoning_effort: str | None = None
     cost_usd: float | None = None
     latency_ms: int | None = None
+    latency_first_token_ms: int | None = None
 
 
 class RequestLogsResponse(DashboardModel):

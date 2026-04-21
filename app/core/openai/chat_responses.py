@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass, field
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -135,6 +136,7 @@ class ToolCallIndex:
 @dataclass
 class _ChatChunkState:
     tool_index: ToolCallIndex = field(default_factory=ToolCallIndex)
+    tool_calls: list["ToolCallState"] = field(default_factory=list)
     saw_tool_call: bool = False
     sent_role: bool = False
 
@@ -146,6 +148,7 @@ class ToolCallDelta:
     name: str | None
     arguments: str | None
     tool_type: str | None
+    arguments_mode: Literal["append", "replace"] = "append"
 
     def to_chunk_call(self) -> ChatToolCallDelta:
         function = _build_tool_call_function(self.name, self.arguments)
@@ -164,16 +167,46 @@ class ToolCallState:
     name: str | None = None
     arguments: str = ""
     tool_type: str = "function"
+    emitted_call_id: str | None = None
+    emitted_name: str | None = None
+    emitted_arguments: str = ""
+    emitted_tool_type: str | None = None
 
     def apply_delta(self, delta: ToolCallDelta) -> None:
         if delta.call_id:
             self.call_id = delta.call_id
         if delta.name:
             self.name = delta.name
-        if delta.arguments:
-            self.arguments += delta.arguments
+        if delta.arguments is not None:
+            if delta.arguments_mode == "replace":
+                self.arguments = delta.arguments
+            elif delta.arguments:
+                self.arguments += delta.arguments
         if delta.tool_type:
             self.tool_type = delta.tool_type
+
+    def build_stream_delta(self) -> ToolCallDelta | None:
+        call_id = _pending_stream_value(self.emitted_call_id, self.call_id)
+        name = _pending_stream_value(self.emitted_name, self.name)
+        arguments = _pending_stream_arguments(self.emitted_arguments, self.arguments)
+        tool_type = self.tool_type or "function"
+        if call_id is None and name is None and arguments is None and self.emitted_tool_type == tool_type:
+            return None
+
+        if call_id is not None:
+            self.emitted_call_id = self.call_id
+        if name is not None:
+            self.emitted_name = self.name
+        if arguments is not None:
+            self.emitted_arguments = self.arguments
+        self.emitted_tool_type = tool_type
+        return ToolCallDelta(
+            index=self.index,
+            call_id=call_id,
+            name=name,
+            arguments=arguments,
+            tool_type=tool_type,
+        )
 
     def to_message_tool_call(self) -> ChatMessageToolCall | None:
         function = _build_tool_call_function(self.name, self.arguments or None)
@@ -243,28 +276,31 @@ def iter_chat_chunks(
                 state.sent_role = True
         tool_delta = _tool_call_delta_from_payload(payload, state.tool_index)
         if tool_delta is not None:
-            state.saw_tool_call = True
-            role = None
-            if not state.sent_role:
-                role = "assistant"
-            chunk = ChatCompletionChunk(
-                id="chatcmpl_temp",
-                created=created,
-                model=model,
-                choices=[
-                    ChatChunkChoice(
-                        index=0,
-                        delta=ChatChunkDelta(
-                            role=role,
-                            tool_calls=[tool_delta.to_chunk_call()],
-                        ),
-                        finish_reason=None,
-                    )
-                ],
-            )
-            yield _dump_chunk(chunk, include_usage=include_usage)
-            if role is not None:
-                state.sent_role = True
+            tool_state = _merge_tool_call_delta(state.tool_calls, tool_delta)
+            stream_delta = tool_state.build_stream_delta()
+            if stream_delta is not None:
+                state.saw_tool_call = True
+                role = None
+                if not state.sent_role:
+                    role = "assistant"
+                chunk = ChatCompletionChunk(
+                    id="chatcmpl_temp",
+                    created=created,
+                    model=model,
+                    choices=[
+                        ChatChunkChoice(
+                            index=0,
+                            delta=ChatChunkDelta(
+                                role=role,
+                                tool_calls=[stream_delta.to_chunk_call()],
+                            ),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                yield _dump_chunk(chunk, include_usage=include_usage)
+                if role is not None:
+                    state.sent_role = True
         if event_type in ("response.failed", "error"):
             error = None
             if event_type == "response.failed":
@@ -283,6 +319,32 @@ def iter_chat_chunks(
                 yield "data: [DONE]\n\n"
                 return
         if event_type in ("response.completed", "response.incomplete"):
+            for tool_state in state.tool_calls:
+                stream_delta = tool_state.build_stream_delta()
+                if stream_delta is None:
+                    continue
+                state.saw_tool_call = True
+                role = None
+                if not state.sent_role:
+                    role = "assistant"
+                chunk = ChatCompletionChunk(
+                    id="chatcmpl_temp",
+                    created=created,
+                    model=model,
+                    choices=[
+                        ChatChunkChoice(
+                            index=0,
+                            delta=ChatChunkDelta(
+                                role=role,
+                                tool_calls=[stream_delta.to_chunk_call()],
+                            ),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                yield _dump_chunk(chunk, include_usage=include_usage)
+                if role is not None:
+                    state.sent_role = True
             usage = None
             if include_usage:
                 response = payload.get("response")
@@ -325,7 +387,10 @@ async def stream_chat_chunks(
 ) -> AsyncIterator[str]:
     created = int(time.time())
     state = _ChatChunkState()
+    terminal_chunk_sent = False
     async for line in stream:
+        if terminal_chunk_sent:
+            continue
         for chunk in iter_chat_chunks(
             [line],
             model=model,
@@ -335,7 +400,8 @@ async def stream_chat_chunks(
         ):
             yield chunk
             if chunk.strip() == "data: [DONE]":
-                return
+                terminal_chunk_sent = True
+                break
 
 
 async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> ChatCompletionResult:
@@ -464,10 +530,11 @@ def _dump_sse(payload: dict[str, JsonValue]) -> str:
 
 
 def _finish_reason_from_incomplete(response: JsonValue | None) -> str:
-    if not is_json_mapping(response):
+    response_mapping = _as_mapping(response)
+    if response_mapping is None:
         return "stop"
-    details = response.get("incomplete_details")
-    if is_json_mapping(details):
+    details = _as_mapping(response_mapping.get("incomplete_details"))
+    if details is not None:
         reason = details.get("reason")
         if reason in ("max_output_tokens", "max_tokens"):
             return "length"
@@ -536,6 +603,7 @@ def _tool_call_delta_from_payload(payload: Mapping[str, JsonValue], indexer: Too
         name=name,
         arguments=arguments,
         tool_type=tool_type,
+        arguments_mode=_tool_call_arguments_mode(payload),
     )
 
 
@@ -636,23 +704,36 @@ def _tool_call_key(call_id: str | None, name: str | None) -> str | None:
     return None
 
 
+def _tool_call_arguments_mode(payload: Mapping[str, JsonValue]) -> Literal["append", "replace"]:
+    event_type = payload.get("type")
+    if isinstance(event_type, str):
+        if event_type.endswith(".delta"):
+            return "append"
+        if event_type.endswith(".done"):
+            return "replace"
+        if event_type == "response.output_item.added":
+            return "replace"
+    return "replace"
+
+
 def _as_mapping(value: JsonValue) -> Mapping[str, JsonValue] | None:
     if is_json_mapping(value):
         return value
     return None
 
 
-def _first_str(*values: object) -> str | None:
+def _first_str(*values: JsonValue) -> str | None:
     for value in values:
         if isinstance(value, str) and value:
             return value
     return None
 
 
-def _merge_tool_call_delta(tool_calls: list[ToolCallState], delta: ToolCallDelta) -> None:
+def _merge_tool_call_delta(tool_calls: list[ToolCallState], delta: ToolCallDelta) -> ToolCallState:
     while len(tool_calls) <= delta.index:
         tool_calls.append(ToolCallState(index=len(tool_calls)))
     tool_calls[delta.index].apply_delta(delta)
+    return tool_calls[delta.index]
 
 
 def _compact_tool_calls(tool_calls: list[ToolCallState]) -> list[ChatMessageToolCall]:
@@ -662,3 +743,24 @@ def _compact_tool_calls(tool_calls: list[ToolCallState]) -> list[ChatMessageTool
         if tool_call is not None:
             cleaned.append(tool_call)
     return cleaned
+
+
+def _pending_stream_value(emitted: str | None, current: str | None) -> str | None:
+    if current is None:
+        return None
+    if emitted is None or emitted != current:
+        return current
+    return None
+
+
+def _pending_stream_arguments(emitted: str, current: str) -> str | None:
+    if not current or current == emitted:
+        return None
+    if not emitted:
+        return current
+    if current.startswith(emitted):
+        suffix = current[len(emitted) :]
+        return suffix or None
+    # Chat Completions tool-call arguments are append-only, so snapshot rewrites
+    # that change previously emitted bytes cannot be represented safely.
+    return None

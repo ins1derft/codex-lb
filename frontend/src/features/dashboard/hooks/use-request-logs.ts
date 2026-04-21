@@ -21,6 +21,16 @@ const DEFAULT_FILTER_STATE: FilterState = {
   offset: 0,
 };
 
+const REQUEST_LOG_PARAM_KEYS = [
+  "search",
+  "timeframe",
+  "accountId",
+  "modelOption",
+  "status",
+  "limit",
+  "offset",
+] as const;
+
 function parseNumber(value: string | null, fallback: number): number {
   if (value === null) {
     return fallback;
@@ -47,8 +57,11 @@ function parseFilterState(params: URLSearchParams): FilterState {
   return DEFAULT_FILTER_STATE;
 }
 
-function writeFilterState(state: FilterState): URLSearchParams {
-  const params = new URLSearchParams();
+function writeFilterState(state: FilterState, base?: URLSearchParams): URLSearchParams {
+  const params = new URLSearchParams(base);
+  for (const key of REQUEST_LOG_PARAM_KEYS) {
+    params.delete(key);
+  }
   if (state.search) {
     params.set("search", state.search);
   }
@@ -135,7 +148,7 @@ export function useRequestLogs() {
       ...filters,
       ...patch,
     };
-    setSearchParams(writeFilterState(nextState));
+    setSearchParams(writeFilterState(nextState, searchParams));
   };
 
   return {

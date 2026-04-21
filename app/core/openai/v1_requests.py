@@ -28,6 +28,7 @@ class V1ResponsesRequest(BaseModel):
     store: bool | None = None
     stream: bool | None = None
     include: list[str] = Field(default_factory=list)
+    service_tier: str | None = None
     conversation: str | None = None
     previous_response_id: str | None = None
     truncation: str | None = None
@@ -46,14 +47,12 @@ class V1ResponsesRequest(BaseModel):
     @field_validator("store")
     @classmethod
     def _ensure_store_false(cls, value: bool | None) -> bool | None:
-        if value is True:
-            raise ValueError("store must be false")
-        return value
+        return False
 
     @field_validator("tools")
     @classmethod
     def _validate_tools(cls, value: list[JsonValue]) -> list[JsonValue]:
-        return validate_tool_types(value)
+        return validate_tool_types(value, allow_builtin_tools=True)
 
     @model_validator(mode="after")
     def _validate_input(self) -> "V1ResponsesRequest":
@@ -97,6 +96,7 @@ class V1ResponsesCompactRequest(BaseModel):
     messages: list[JsonValue] | None = None
     input: JsonValue | None = None
     instructions: str | None = None
+    reasoning: ResponsesReasoning | None = None
 
     @model_validator(mode="after")
     def _validate_input(self) -> "V1ResponsesCompactRequest":

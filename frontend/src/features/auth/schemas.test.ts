@@ -9,11 +9,8 @@ describe("AuthSessionSchema", () => {
       passwordRequired: true,
       totpRequiredOnLogin: false,
       totpConfigured: true,
-      user: {
-        id: "dashboard-user-admin-default",
-        username: "admin",
-        role: "admin",
-      },
+      authMode: "trusted_header",
+      passwordManagementEnabled: true,
     });
 
     expect(parsed).toEqual({
@@ -21,11 +18,11 @@ describe("AuthSessionSchema", () => {
       passwordRequired: true,
       totpRequiredOnLogin: false,
       totpConfigured: true,
-      user: {
-        id: "dashboard-user-admin-default",
-        username: "admin",
-        role: "admin",
-      },
+      bootstrapRequired: false,
+      bootstrapTokenConfigured: false,
+      authMode: "trusted_header",
+      passwordManagementEnabled: true,
+      passwordSessionActive: false,
     });
   });
 
@@ -38,13 +35,26 @@ describe("AuthSessionSchema", () => {
 
     expect(result.success).toBe(false);
   });
+
+  it("defaults optional auth mode fields for older responses", () => {
+    const parsed = AuthSessionSchema.parse({
+      authenticated: true,
+      passwordRequired: false,
+      totpRequiredOnLogin: false,
+      totpConfigured: false,
+    });
+
+    expect(parsed.bootstrapRequired).toBe(false);
+    expect(parsed.bootstrapTokenConfigured).toBe(false);
+    expect(parsed.authMode).toBe("standard");
+    expect(parsed.passwordManagementEnabled).toBe(true);
+  });
 });
 
 describe("LoginRequestSchema", () => {
-  it("accepts non-empty username and password", () => {
+  it("accepts non-empty password", () => {
     expect(
       LoginRequestSchema.safeParse({
-        username: "admin",
         password: "strong-password",
       }).success,
     ).toBe(true);
@@ -53,17 +63,7 @@ describe("LoginRequestSchema", () => {
   it("rejects empty password", () => {
     expect(
       LoginRequestSchema.safeParse({
-        username: "admin",
         password: "",
-      }).success,
-    ).toBe(false);
-  });
-
-  it("rejects empty username", () => {
-    expect(
-      LoginRequestSchema.safeParse({
-        username: "",
-        password: "strong-password",
       }).success,
     ).toBe(false);
   });

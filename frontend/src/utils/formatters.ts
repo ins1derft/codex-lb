@@ -1,4 +1,5 @@
 import { RESET_ERROR_LABEL } from "@/utils/constants";
+import { getTimeFormatPreference, type TimeFormatPreference } from "@/hooks/use-time-format";
 
 const numberFormatter = new Intl.NumberFormat("en-US");
 const compactFormatter = new Intl.NumberFormat("en-US", {
@@ -11,21 +12,54 @@ const currencyFormatter = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 2,
   maximumFractionDigits: 2,
 });
-const timeFormatter = new Intl.DateTimeFormat("en-US", {
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-});
 const dateFormatter = new Intl.DateTimeFormat("en-US", {
   year: "numeric",
   month: "2-digit",
   day: "2-digit",
 });
+const timeFormatterMap: Record<TimeFormatPreference, Intl.DateTimeFormat> = {
+  "12h": new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h12",
+  }),
+  "24h": new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }),
+};
+const chartDateTimeFormatterMap: Record<TimeFormatPreference, Intl.DateTimeFormat> = {
+  "12h": new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h12",
+  }),
+  "24h": new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }),
+};
 
 export type FormattedDateTime = {
   time: string;
   date: string;
 };
+
+function getTimeFormatter(): Intl.DateTimeFormat {
+  return timeFormatterMap[getTimeFormatPreference()];
+}
+
+function getChartDateTimeFormatter(): Intl.DateTimeFormat {
+  return chartDateTimeFormatterMap[getTimeFormatPreference()];
+}
 
 type TokenState = {
   state?: string | null;
@@ -161,13 +195,19 @@ export function formatCachedTokensMeta(totalTokens: unknown, cachedInputTokens: 
   return `Cached: ${formatCompactNumber(cached)} (${Math.round(percent)}%)`;
 }
 
-export function formatModelLabel(model: string | null | undefined, reasoningEffort: string | null | undefined): string {
+export function formatModelLabel(
+  model: string | null | undefined,
+  reasoningEffort: string | null | undefined,
+  serviceTier?: string | null | undefined,
+): string {
   const base = (model || "").trim();
   if (!base) {
     return "--";
   }
   const effort = (reasoningEffort || "").trim();
-  return effort ? `${base} (${effort})` : base;
+  const tier = (serviceTier || "").trim();
+  const suffix = [effort, tier].filter(Boolean).join(", ");
+  return suffix ? `${base} (${suffix})` : base;
 }
 
 export function formatTimeLong(iso: string | null | undefined): FormattedDateTime {
@@ -176,9 +216,19 @@ export function formatTimeLong(iso: string | null | undefined): FormattedDateTim
     return { time: "--", date: "--" };
   }
   return {
-    time: timeFormatter.format(date),
+    time: getTimeFormatter().format(date),
     date: dateFormatter.format(date),
   };
+}
+
+export function formatDateTimeInline(iso: string | null | undefined): string {
+  const formatted = formatTimeLong(iso);
+  return formatted.time === "--" ? "--" : `${formatted.time} ${formatted.date}`;
+}
+
+export function formatChartDateTime(iso: string | null | undefined): string {
+  const date = parseDate(iso);
+  return date ? getChartDateTimeFormatter().format(date) : "--";
 }
 
 export function formatRelative(ms: number): string {
@@ -192,6 +242,28 @@ export function formatRelative(ms: number): string {
   }
   const days = Math.ceil(hours / 24);
   return `in ${days}d`;
+}
+
+export function formatResetRelative(ms: number): string {
+  if (ms <= 60_000) {
+    return "in 1m";
+  }
+
+  const totalMinutes = Math.floor(ms / 60_000);
+  if (totalMinutes < 60) {
+    return `in ${totalMinutes}m`;
+  }
+
+  if (totalMinutes < 1440) {
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes > 0 ? `in ${hours}h ${minutes}m` : `in ${hours}h`;
+  }
+
+  const totalHours = Math.floor(ms / 3_600_000);
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours > 0 ? `in ${days}d ${hours}h` : `in ${days}d`;
 }
 
 export function formatCountdown(seconds: number): string {
@@ -210,7 +282,7 @@ export function formatQuotaResetLabel(resetAt: string | null | undefined): strin
   if (diffMs <= 0) {
     return "now";
   }
-  return formatRelative(diffMs);
+  return formatResetRelative(diffMs);
 }
 
 export function formatQuotaResetMeta(

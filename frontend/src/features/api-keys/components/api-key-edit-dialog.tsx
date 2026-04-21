@@ -15,10 +15,18 @@ import {
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { ExpiryPicker } from "@/features/api-keys/components/expiry-picker";
 import { LimitRulesEditor } from "@/features/api-keys/components/limit-rules-editor";
+import { AccountMultiSelect } from "@/features/api-keys/components/account-multi-select";
 import { ModelMultiSelect } from "@/features/api-keys/components/model-multi-select";
-import type { ApiKey, ApiKeyUpdateRequest, LimitRuleCreate, LimitType } from "@/features/api-keys/schemas";
+import type { ApiKey, ApiKeyUpdateRequest, LimitRuleCreate, LimitType, ServiceTierType } from "@/features/api-keys/schemas";
 import { parseDate } from "@/utils/formatters";
 
 import { hasLimitRuleChanges, normalizeLimitRules } from "./limit-rules-utils";
@@ -54,6 +62,15 @@ function limitsToCreateRules(apiKey: ApiKey): LimitRuleCreate[] {
   }));
 }
 
+function hasSelectionChange(initialIds: string[], nextIds: string[]): boolean {
+  if (initialIds.length !== nextIds.length) {
+    return true;
+  }
+
+  const initialIdSet = new Set(initialIds);
+  return nextIds.some((accountId) => !initialIdSet.has(accountId));
+}
+
 function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps) {
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
@@ -64,22 +81,43 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
   });
 
   const [selectedModels, setSelectedModels] = useState<string[]>(apiKey.allowedModels || []);
+  const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>(apiKey.assignedAccountIds);
   const initialLimitRules = useMemo(() => limitsToCreateRules(apiKey), [apiKey]);
   const [limitRules, setLimitRules] = useState<LimitRuleCreate[]>(() => initialLimitRules);
   const [expiresAt, setExpiresAt] = useState<Date | null>(() => parseDate(apiKey.expiresAt));
+  const [enforcedModel, setEnforcedModel] = useState<string>(apiKey.enforcedModel || "");
+  const [enforcedReasoningEffort, setEnforcedReasoningEffort] = useState<string>(
+    apiKey.enforcedReasoningEffort || "none",
+  );
+  const [enforcedServiceTier, setEnforcedServiceTier] = useState<string>(
+    apiKey.enforcedServiceTier || "none",
+  );
 
   const handleSubmit = async (values: FormValues) => {
     const normalizedLimits = normalizeLimitRules(limitRules);
+    const shouldSubmitAssignedAccountIds =
+      hasSelectionChange(apiKey.assignedAccountIds, selectedAccountIds) ||
+      (apiKey.accountAssignmentScopeEnabled && selectedAccountIds.length === 0);
     const payload: ApiKeyUpdateRequest = {
       name: values.name,
       allowedModels: selectedModels.length > 0 ? selectedModels : null,
+      enforcedModel: enforcedModel.trim() ? enforcedModel.trim() : null,
+      enforcedReasoningEffort: enforcedReasoningEffort === "none" ? null : enforcedReasoningEffort as "minimal" | "low" | "medium" | "high" | "xhigh",
+      enforcedServiceTier: enforcedServiceTier === "none" ? null : enforcedServiceTier as ServiceTierType,
       expiresAt: expiresAt?.toISOString() ?? null,
       isActive: values.isActive,
     };
+    if (shouldSubmitAssignedAccountIds) {
+      payload.assignedAccountIds = selectedAccountIds;
+    }
     if (hasLimitRuleChanges(initialLimitRules, limitRules)) {
       payload.limits = normalizedLimits;
     }
-    await onSubmit(payload);
+    try {
+      await onSubmit(payload);
+    } catch {
+      return;
+    }
     onClose();
   };
 
@@ -106,12 +144,60 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
             />
 
             <div className="space-y-1">
-              <label className="text-sm font-medium">Allowed models</label>
+              <div className="text-sm font-medium">Allowed models</div>
               <ModelMultiSelect value={selectedModels} onChange={setSelectedModels} />
             </div>
 
             <div className="space-y-1">
-              <label className="text-sm font-medium">Expiry</label>
+              <div className="text-sm font-medium">Assigned accounts</div>
+              <AccountMultiSelect value={selectedAccountIds} onChange={setSelectedAccountIds} />
+            </div>
+
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Enforced model</div>
+              <Input
+                value={enforcedModel}
+                onChange={(e) => setEnforcedModel(e.target.value)}
+                placeholder="e.g. gpt-5.3-codex"
+                autoComplete="off"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Enforced reasoning</div>
+              <Select value={enforcedReasoningEffort} onValueChange={setEnforcedReasoningEffort}>
+                <SelectTrigger>
+                  <SelectValue placeholder="None" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">None</SelectItem>
+                  <SelectItem value="minimal">Minimal</SelectItem>
+                  <SelectItem value="low">Low</SelectItem>
+                  <SelectItem value="medium">Medium</SelectItem>
+                  <SelectItem value="high">High</SelectItem>
+                  <SelectItem value="xhigh">XHigh</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Enforced service tier</div>
+              <Select value={enforcedServiceTier} onValueChange={setEnforcedServiceTier}>
+                <SelectTrigger>
+                  <SelectValue placeholder="None" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">None</SelectItem>
+                  <SelectItem value="auto">Auto</SelectItem>
+                  <SelectItem value="default">Default</SelectItem>
+                  <SelectItem value="priority">Priority</SelectItem>
+                  <SelectItem value="flex">Flex</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Expiry</div>
               <ExpiryPicker value={expiresAt} onChange={setExpiresAt} />
             </div>
 
@@ -134,7 +220,7 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
 
             {apiKey.limits.length > 0 ? (
               <div className="space-y-1">
-                <label className="text-xs font-medium text-muted-foreground">Current usage</label>
+                <div className="text-xs font-medium text-muted-foreground">Current usage</div>
                 <div className="space-y-1">
                   {apiKey.limits.map((limit) => (
                     <LimitUsageBar key={limit.id} limit={limit} />
@@ -189,6 +275,7 @@ const LIMIT_TYPE_SHORT: Record<LimitType, string> = {
   input_tokens: "Input",
   output_tokens: "Output",
   cost_usd: "Cost",
+  credits: "Credits",
 };
 
 function formatTokenCount(n: number): string {

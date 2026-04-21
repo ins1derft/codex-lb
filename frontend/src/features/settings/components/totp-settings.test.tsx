@@ -19,7 +19,10 @@ vi.mock("@/features/auth/api", () => ({
 
 const baseSettings = {
   stickyThreadsEnabled: true,
+  upstreamStreamTransport: "default" as const,
   preferEarlierResetAccounts: false,
+  routingStrategy: "usage_weighted" as const,
+  openaiCacheAffinityMaxAgeSeconds: 300,
   importWithoutOverwrite: false,
   totpRequiredOnLogin: false,
   totpConfigured: false,
@@ -101,7 +104,10 @@ describe("TotpSettings", () => {
     await user.click(screen.getByRole("switch"));
     expect(onSave).toHaveBeenCalledWith({
       stickyThreadsEnabled: true,
+      upstreamStreamTransport: "default",
       preferEarlierResetAccounts: false,
+      routingStrategy: "usage_weighted",
+      openaiCacheAffinityMaxAgeSeconds: 300,
       importWithoutOverwrite: false,
       totpRequiredOnLogin: true,
       apiKeyAuthEnabled: true,

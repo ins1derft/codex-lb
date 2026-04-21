@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 import aiohttp
 
@@ -13,7 +14,7 @@ from app.core.types import JsonValue
 logger = logging.getLogger(__name__)
 
 _FETCH_TIMEOUT_SECONDS = 15.0
-_FILTERED_FIELDS = {"base_instructions", "model_messages"}
+_FILTERED_FIELDS = {"model_messages"}
 
 
 class ModelFetchError(Exception):
@@ -43,17 +44,27 @@ def _opt_str(data: dict[str, JsonValue], key: str) -> str | None:
 def _list_raw(data: dict[str, JsonValue], key: str) -> list[JsonValue]:
     v = data.get(key)
     if isinstance(v, list):
-        return v  # type: ignore[return-value]
+        return cast(list[JsonValue], v)
     return []
+
+
+def _parse_reasoning_level(value: JsonValue) -> ReasoningLevel | None:
+    if not isinstance(value, dict):
+        return None
+    effort = value.get("effort")
+    description = value.get("description")
+    if not isinstance(effort, str) or not isinstance(description, str):
+        return None
+    return ReasoningLevel(effort=effort, description=description)
 
 
 def _parse_upstream_model(data: dict[str, JsonValue]) -> UpstreamModel:
     raw = {k: v for k, v in data.items() if k not in _FILTERED_FIELDS}
 
     reasoning_levels = tuple(
-        ReasoningLevel(effort=rl.get("effort", ""), description=rl.get("description", ""))
+        parsed_level
         for rl in _list_raw(data, "supported_reasoning_levels")
-        if isinstance(rl, dict)
+        if (parsed_level := _parse_reasoning_level(rl)) is not None
     )
 
     available_in_plans = frozenset(p for p in _list_raw(data, "available_in_plans") if isinstance(p, str))
@@ -63,6 +74,7 @@ def _parse_upstream_model(data: dict[str, JsonValue]) -> UpstreamModel:
         slug=_str(data, "slug"),
         display_name=_str(data, "display_name"),
         description=_str(data, "description"),
+        base_instructions=_str(data, "base_instructions"),
         context_window=_int(data, "context_window"),
         input_modalities=input_modalities,
         supported_reasoning_levels=reasoning_levels,

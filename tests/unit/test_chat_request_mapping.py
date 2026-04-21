@@ -78,6 +78,35 @@ def test_chat_max_tokens_are_stripped():
     assert "max_completion_tokens" not in dumped
 
 
+def test_chat_temperature_is_stripped_for_upstream_compat():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.2,
+        "safety_identifier": "safe_123",
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    assert "temperature" not in dumped
+    assert "safety_identifier" not in dumped
+
+
+def test_chat_prompt_cache_controls_are_preserved():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "prompt_cache_key": "thread_123",
+        "prompt_cache_retention": "4h",
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+
+    assert dumped["prompt_cache_key"] == "thread_123"
+    assert "prompt_cache_retention" not in dumped
+
+
 def test_chat_reasoning_effort_maps_to_responses_reasoning():
     payload = {
         "model": "gpt-5.2",
@@ -92,6 +121,19 @@ def test_chat_reasoning_effort_maps_to_responses_reasoning():
     assert isinstance(reasoning, Mapping)
     reasoning_map = cast(Mapping[str, JsonValue], reasoning)
     assert reasoning_map.get("effort") == "high"
+
+
+def test_chat_service_tier_is_preserved_in_responses_payload():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "service_tier": "priority",
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+
+    assert dumped["service_tier"] == "priority"
 
 
 def test_chat_tools_are_normalized():

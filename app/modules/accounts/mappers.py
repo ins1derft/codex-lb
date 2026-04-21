@@ -10,7 +10,9 @@ from app.core.usage.types import UsageTrendBucket, UsageWindowRow
 from app.core.utils.time import from_epoch_seconds
 from app.db.models import Account, UsageHistory
 from app.modules.accounts.schemas import (
+    AccountAdditionalQuota,
     AccountAuthStatus,
+    AccountRequestUsage,
     AccountSummary,
     AccountTokenStatus,
     AccountUsage,
@@ -24,6 +26,8 @@ def build_account_summaries(
     accounts: list[Account],
     primary_usage: dict[str, UsageHistory],
     secondary_usage: dict[str, UsageHistory],
+    request_usage_by_account: dict[str, AccountRequestUsage] | None = None,
+    additional_quotas_by_account: dict[str, list[AccountAdditionalQuota]] | None = None,
     encryptor: TokenEncryptor,
     include_auth: bool = True,
 ) -> list[AccountSummary]:
@@ -32,6 +36,8 @@ def build_account_summaries(
             account,
             primary_usage.get(account.id),
             secondary_usage.get(account.id),
+            request_usage_by_account.get(account.id) if request_usage_by_account else None,
+            additional_quotas_by_account.get(account.id) if additional_quotas_by_account else None,
             encryptor,
             include_auth=include_auth,
         )
@@ -43,6 +49,8 @@ def _account_to_summary(
     account: Account,
     primary_usage: UsageHistory | None,
     secondary_usage: UsageHistory | None,
+    request_usage: AccountRequestUsage | None,
+    additional_quotas: list[AccountAdditionalQuota] | None,
     encryptor: TokenEncryptor,
     include_auth: bool = True,
 ) -> AccountSummary:
@@ -106,6 +114,8 @@ def _account_to_summary(
         remaining_credits_primary=remaining_credits_primary,
         capacity_credits_secondary=capacity_secondary,
         remaining_credits_secondary=remaining_credits_secondary,
+        request_usage=request_usage,
+        additional_quotas=additional_quotas or [],
         deactivation_reason=account.deactivation_reason,
         auth=auth_status,
     )

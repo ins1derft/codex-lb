@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
+    uv sync --frozen --no-dev --no-install-project --extra metrics --extra tracing
 
 FROM python:3.13-slim AS runtime
 
@@ -42,6 +42,7 @@ RUN adduser --disabled-password --gecos "" app \
 
 COPY --from=python-build /opt/venv /opt/venv
 COPY app app
+COPY config config
 COPY scripts scripts
 COPY --from=frontend-build /app/app/static app/static
 

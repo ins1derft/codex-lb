@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 from app.core.utils.time import utcnow
 from app.db.models import (
     ApiKey,
+    ApiKeyAccountAssignment,
     ApiKeyLimit,
     ApiKeyUsageReservation,
     ApiKeyUsageReservationItem,
@@ -57,14 +58,22 @@ class ApiKeysRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    def _select_api_key(self):
+        return select(ApiKey).options(
+            selectinload(ApiKey.limits),
+            selectinload(ApiKey.account_assignments),
+        )
+
     async def create(self, row: ApiKey) -> ApiKey:
         self._session.add(row)
         await self._session.commit()
-        await self._session.refresh(row)
-        return row
+        created = await self.get_by_id(row.id)
+        assert created is not None
+        return created
 
     async def get_by_id(self, key_id: str, *, owner_user_id: str | None = None) -> ApiKey | None:
-        row = await self._session.get(ApiKey, key_id)
+        result = await self._session.execute(self._select_api_key().where(ApiKey.id == key_id))
+        row = result.scalar_one_or_none()
         if row is None:
             return None
         if owner_user_id is not None and row.owner_user_id != owner_user_id:
@@ -72,13 +81,11 @@ class ApiKeysRepository:
         return row
 
     async def get_by_hash(self, key_hash: str) -> ApiKey | None:
-        result = await self._session.execute(
-            select(ApiKey).options(selectinload(ApiKey.limits)).where(ApiKey.key_hash == key_hash)
-        )
+        result = await self._session.execute(self._select_api_key().where(ApiKey.key_hash == key_hash))
         return result.scalar_one_or_none()
 
     async def list_all(self, *, owner_user_id: str | None = None) -> list[ApiKey]:
-        stmt = select(ApiKey).order_by(ApiKey.created_at.desc())
+        stmt = self._select_api_key().order_by(ApiKey.created_at.desc())
         if owner_user_id is not None:
             stmt = stmt.where(ApiKey.owner_user_id == owner_user_id)
         result = await self._session.execute(stmt)

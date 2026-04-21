@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
 import {
   getAuthSession,
@@ -21,11 +21,11 @@ const sessionBase: AuthSession = {
   passwordRequired: true,
   totpRequiredOnLogin: false,
   totpConfigured: true,
-  user: {
-    id: "dashboard-user-admin-default",
-    username: "admin",
-    role: "admin",
-  },
+  bootstrapRequired: false,
+  bootstrapTokenConfigured: false,
+  authMode: "standard",
+  passwordManagementEnabled: true,
+  passwordSessionActive: false,
 };
 
 function resetAuthStore(): void {
@@ -34,7 +34,10 @@ function resetAuthStore(): void {
     authenticated: false,
     totpRequiredOnLogin: false,
     totpConfigured: false,
-    user: null,
+    bootstrapRequired: false,
+    bootstrapTokenConfigured: false,
+    authMode: "standard",
+    passwordManagementEnabled: true,
     loading: false,
     initialized: false,
     error: null,
@@ -48,11 +51,10 @@ describe("useAuthStore actions", () => {
   });
 
   it("refreshSession updates auth state", async () => {
-    vi.mocked(getAuthSession).mockResolvedValue({
+    (getAuthSession as Mock).mockResolvedValue({
       ...sessionBase,
       authenticated: false,
       totpRequiredOnLogin: true,
-      user: null,
     });
 
     await useAuthStore.getState().refreshSession();
@@ -65,14 +67,13 @@ describe("useAuthStore actions", () => {
   });
 
   it("login updates session state", async () => {
-    vi.mocked(loginPassword).mockResolvedValue(sessionBase);
+    (loginPassword as Mock).mockResolvedValue(sessionBase);
 
-    await useAuthStore.getState().login("admin", "secret-pass");
+    await useAuthStore.getState().login("secret-pass");
 
     const next = useAuthStore.getState();
-    expect(loginPassword).toHaveBeenCalledWith({ username: "admin", password: "secret-pass" });
+    expect(loginPassword).toHaveBeenCalledWith({ password: "secret-pass" });
     expect(next.authenticated).toBe(true);
-    expect(next.user?.username).toBe("admin");
     expect(next.error).toBeNull();
   });
 
@@ -83,12 +84,11 @@ describe("useAuthStore actions", () => {
       initialized: true,
     });
 
-    vi.mocked(logoutRequest).mockResolvedValue({ status: "ok" });
-    vi.mocked(getAuthSession).mockResolvedValue({
+    (logoutRequest as Mock).mockResolvedValue({ status: "ok" });
+    (getAuthSession as Mock).mockResolvedValue({
       ...sessionBase,
       authenticated: false,
       totpRequiredOnLogin: false,
-      user: null,
     });
 
     await useAuthStore.getState().logout();
@@ -97,12 +97,11 @@ describe("useAuthStore actions", () => {
     expect(logoutRequest).toHaveBeenCalledTimes(1);
     expect(getAuthSession).toHaveBeenCalledTimes(1);
     expect(next.authenticated).toBe(false);
-    expect(next.user).toBeNull();
     expect(next.loading).toBe(false);
   });
 
   it("verifyTotp updates state transitions", async () => {
-    vi.mocked(verifyTotpRequest).mockResolvedValue({
+    (verifyTotpRequest as Mock).mockResolvedValue({
       ...sessionBase,
       authenticated: true,
       totpRequiredOnLogin: false,
