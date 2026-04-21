@@ -91,6 +91,11 @@ class SSEResponseProtocol(Protocol):
 SSEResponse: TypeAlias = aiohttp.ClientResponse | SSEResponseProtocol
 
 
+class CompactTimeoutSettings(Protocol):
+    upstream_connect_timeout_seconds: float
+    compact_response_timeout_seconds: float
+
+
 class ProxyResponseError(Exception):
     status_code: int
     payload: OpenAIErrorEnvelope
@@ -702,11 +707,7 @@ async def compact_responses(
         account_id,
         accept="application/json",
     )
-    timeout = aiohttp.ClientTimeout(
-        total=60,
-        sock_connect=settings.upstream_connect_timeout_seconds,
-        sock_read=60,
-    )
+    timeout = _compact_request_timeout(settings)
 
     client_session = session or get_http_client().session
     payload_dict = payload.to_payload()
@@ -747,3 +748,11 @@ async def compact_responses(
             502,
             openai_error("upstream_unavailable", str(exc)),
         ) from exc
+
+
+def _compact_request_timeout(settings: CompactTimeoutSettings) -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(
+        total=None,
+        sock_connect=settings.upstream_connect_timeout_seconds,
+        sock_read=settings.compact_response_timeout_seconds,
+    )

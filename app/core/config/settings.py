@@ -50,8 +50,9 @@ class Settings(BaseSettings):
     database_sqlite_pre_migrate_backup_enabled: bool = True
     database_sqlite_pre_migrate_backup_max_files: int = Field(default=5, ge=1)
     upstream_base_url: str = "https://chatgpt.com/backend-api"
-    upstream_connect_timeout_seconds: float = 30.0
-    stream_idle_timeout_seconds: float = 300.0
+    upstream_connect_timeout_seconds: float = Field(default=30.0, gt=0)
+    compact_response_timeout_seconds: float = Field(default=300.0, gt=0)
+    stream_idle_timeout_seconds: float = Field(default=300.0, gt=0)
     max_sse_event_bytes: int = Field(default=2 * 1024 * 1024, gt=0)
     auth_base_url: str = "https://auth.openai.com"
     oauth_client_id: str = "app_EMoamEEZ73f0CkXaXp7hrann"

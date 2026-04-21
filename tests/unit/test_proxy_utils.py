@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import app.core.clients.proxy as proxy_module
 from app.core.clients.proxy import _build_upstream_headers, filter_inbound_headers
 from app.core.openai.parsing import parse_sse_event
-from app.core.openai.requests import ResponsesRequest
+from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.utils.request_id import reset_request_id, set_request_id
 from app.modules.proxy import service as proxy_service
 
@@ -204,3 +205,41 @@ def test_settings_parses_image_inline_allowlist_from_csv(monkeypatch):
     settings = Settings()
 
     assert settings.image_inline_allowed_hosts == ["a.example", "b.example", "c.example"]
+
+
+@pytest.mark.asyncio
+async def test_compact_responses_uses_configured_timeout(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 7.5
+        compact_response_timeout_seconds = 420.0
+        image_inline_fetch_enabled = False
+
+    payload = ResponsesCompactRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": []})
+    response = MagicMock()
+    response.status = 200
+    response.json = AsyncMock(return_value={"output": []})
+    response.__aenter__ = AsyncMock(return_value=response)
+    response.__aexit__ = AsyncMock(return_value=False)
+
+    session = MagicMock()
+    session.post = MagicMock(return_value=response)
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+
+    result = await proxy_module.compact_responses(payload, {}, "token", None, session=session)
+
+    assert result.model_dump(mode="json", exclude_none=True) == {"output": []}
+    timeout = session.post.call_args.kwargs["timeout"]
+    assert timeout.total is None
+    assert timeout.sock_connect == pytest.approx(7.5)
+    assert timeout.sock_read == pytest.approx(420.0)
+
+
+def test_settings_parses_compact_response_timeout_from_env(monkeypatch):
+    monkeypatch.setenv("CODEX_LB_COMPACT_RESPONSE_TIMEOUT_SECONDS", "420")
+    from app.core.config.settings import Settings
+
+    settings = Settings()
+
+    assert settings.compact_response_timeout_seconds == pytest.approx(420.0)
